@@ -48,14 +48,11 @@ Supporting modules will capture addressing logic, instruction metadata, and opti
 The emulator builds with any modern C++20 compiler (GCC 10+, Clang 12+, MSVC 2019+). If you are on macOS or Linux, the easiest route is `g++` from the command line; on Windows you can use the same command inside WSL or build with `cl` from the Developer Command Prompt.
 
 1. Open a terminal in the project folder.
-2. Compile the emulator into a single executable:
+2. Build the emulator with the provided Makefile:
    ```bash
-   g++ -std=c++20 -O2 src/main.cpp src/cpu.cpp src/bus.cpp -o emulator
+   make
    ```
-   If you prefer Clang, swap `g++` for `clang++`. Windows users running the Microsoft compiler can instead run:
-   ```bash
-   cl /std:c++20 /O2 src\main.cpp src\cpu.cpp src\bus.cpp /Fe:emulator.exe
-   ```
+   The binary is written to `./emulator`. If you prefer a manual compile, you can still run the `g++` command from the Makefile.
 3. Run a 6502 program (any raw binary) by pointing the emulator at the file:
    ```bash
    ./emulator path/to/program.bin [--start 0x8000] [--max-cycles 1000000] [--trace]
@@ -78,23 +75,13 @@ The emulator exits automatically when the program executes a `BRK` instruction.
 ## Testing (Optional)
 The project ships with unit and integration tests powered by the single-header Catch2 runner in `tests/catch2/catch.hpp`.
 
-Compile the suite next to the emulator binary and run it:
+Build the suite alongside the emulator and run it:
 ```bash
-g++ -std=c++20 -O2 -Isrc -Itests \
-    src/cpu.cpp src/bus.cpp \
-    tests/cpu_tests.cpp tests/integration_timing_tests.cpp \
-    -o cpu_tests
+make tests
 ./cpu_tests
 ```
 
-On Windows with the Microsoft compiler:
-```bash
-cl /std:c++20 /O2 /Isrc /Itests \
-    src\cpu.cpp src\bus.cpp \
-    tests\cpu_tests.cpp tests\integration_timing_tests.cpp \
-    /Fe:cpu_tests.exe
-cpu_tests.exe
-```
+The Makefile uses `g++` by default; swap the compiler by setting `CXX=clang++ make tests` (or similar) if you prefer another toolchain.
 
 The suite covers instruction semantics, decimal-mode arithmetic, and cycle timing. For extended validation suites (e.g., Klaus Dormann's functional ROM), load the binary with the CLI, note the expected halt condition, and add a new fixture under `tests/` when you're ready to automate it.
 
