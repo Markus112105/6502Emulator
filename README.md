@@ -113,3 +113,4 @@ The suite covers instruction semantics, decimal-mode arithmetic, and cycle timin
 
 ## Further Reading
 - [_Programming the 6502_ by Rodnay Zaks](https://archive.org/details/Programming_the_6502) for background on the original processor.
+- [Masswerk 6502 Instruction Set Reference](https://www.masswerk.at/6502/6502_instruction_set.html) for opcode-by-opcode semantics, addressing modes, and cycle counts.
