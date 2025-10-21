@@ -1,7 +1,0 @@
-/Users/markus/projects/6502emulator/build/CMakeFiles/emulator_core.dir
-/Users/markus/projects/6502emulator/build/CMakeFiles/emulator.dir
-/Users/markus/projects/6502emulator/build/CMakeFiles/cpu_tests.dir
-/Users/markus/projects/6502emulator/build/CMakeFiles/tests.dir
-/Users/markus/projects/6502emulator/build/CMakeFiles/test.dir
-/Users/markus/projects/6502emulator/build/CMakeFiles/edit_cache.dir
-/Users/markus/projects/6502emulator/build/CMakeFiles/rebuild_cache.dir
