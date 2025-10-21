@@ -95,9 +95,6 @@ The suite covers instruction semantics, decimal-mode arithmetic, and cycle timin
 │   │   └── catch.hpp
 │   └── support/
 │       └── cpu_harness.hpp
-├── docs/
-│   ├── AGENTS.md
-│   └── DESIGN_NOTES.md
 └── README.md
 ```
 
@@ -109,6 +106,4 @@ The suite covers instruction semantics, decimal-mode arithmetic, and cycle timin
 - Explore optional front-ends such as ImGui timelines or NES cartridge loaders.
 
 ## Further Reading
-- `docs/AGENTS.md` describes contributor workflows and coding conventions.
-- `docs/DESIGN_NOTES.md` captures architectural decisions and future enhancements.
 - [_Programming the 6502_ by Rodnay Zaks](https://archive.org/details/Programming_the_6502) for background on the original processor.
