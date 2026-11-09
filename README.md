@@ -1,8 +1,6 @@
 # 6502 Emulator
 
-[![CI](https://github.com/Markus112105/6502Emulator/actions/workflows/ci.yml/badge.svg)](https://github.com/Markus112105/6502Emulator/actions/workflows/ci.yml)
-
-An emulator for the MOS 6502, the 8-bit CPU inside the Apple II, Commodore 64, and NES, written from scratch in C++20 with no dependencies.
+An emulator for the MOS 6502, the 8-bit CPU inside the Apple II, Commodore 64, and NES. Written from scratch in C++20 with no dependencies.
 
 It passes [Klaus Dormann's 6502 functional test](https://github.com/Klaus2m5/6502_65C02_functional_tests), a ROM that checks every documented opcode in every addressing mode, including decimal-mode arithmetic:
 
@@ -15,8 +13,8 @@ PASS: Klaus Dormann 6502 functional test
 ## What it does
 
 - All 151 documented opcodes (56 instructions, 13 addressing modes).
-- The undocumented NMOS opcodes as well (`LAX`, `SAX`, `DCP`, `ISC`, `SLO`, `RLA`, `SRE`, `RRA`, and the rest). The twelve `JAM` opcodes raise an error instead of locking up.
-- Cycle counting per instruction, including the extra cycle for page crossings and for taken branches.
+- The undocumented NMOS opcodes (`LAX`, `SAX`, `DCP`, `ISC`, `SLO`, `RLA`, `SRE`, `RRA`, and the rest). The twelve `JAM` opcodes raise an error instead of locking up the CPU.
+- Cycle counts for every instruction, including the extra cycles for page crossings and taken branches.
 - BCD arithmetic for `ADC` and `SBC` when the decimal flag is set.
 - Hardware quirks that real software depends on, such as the `JMP ($xxFF)` page-wrap bug and zero-page pointer wrapping.
 - A command-line runner that loads a raw binary, executes it, and can trace every instruction.
@@ -31,7 +29,16 @@ make test           # unit and timing tests
 make functional     # downloads the functional test ROM once, then runs it
 ```
 
-Try it with a six-instruction program that stores a value and counts X down from 5:
+To try it, write a short program by hand. This one stores 1 at `$0200`, counts X down from 5, and stops:
+
+```asm
+LDA #$01
+STA $0200
+LDX #$05
+DEX        ; loop
+BNE loop
+BRK
+```
 
 ```bash
 printf '\xA9\x01\x8D\x00\x02\xA2\x05\xCA\xD0\xFD\x00' > demo.bin
@@ -50,22 +57,18 @@ Start address: $8000, cycle budget: 1000000
 BRK encountered at $800A after 39 cycles.
 ```
 
-Options:
-
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--start <addr>` | `0x8000` | Address the program is loaded at and started from |
 | `--max-cycles <n>` | `1000000` | Stop after this many cycles if the program never reaches `BRK` |
 | `--trace` | off | Print the program counter and opcode of every instruction |
 
-The runner exits with status 0 when the program reaches `BRK`.
+The runner stops at the first `BRK` and exits with status 0.
 
 ## How it works
 
-The code is split the way the hardware is:
-
-- **`src/cpu.cpp`** holds the registers and a 256-entry dispatch table. Each entry pairs an opcode with a handler, an addressing mode, a base cycle count, and whether a page crossing costs an extra cycle. `CPU::step()` fetches one opcode, looks it up, and runs the handler, so each instruction is written once and reused across its addressing modes.
-- **`src/bus.cpp`** owns the 64 KiB address space. The CPU only reaches memory through the bus, which leaves room to add memory-mapped devices without touching the CPU.
+- **`src/cpu.cpp`** holds the registers and a 256-entry dispatch table. Each entry pairs an opcode with a handler, an addressing mode, a base cycle count, and whether a page crossing costs an extra cycle. `CPU::step()` fetches one opcode, looks it up, and runs the handler. Each instruction is written once and shared by all of its addressing modes.
+- **`src/bus.cpp`** owns the 64 KiB address space. The CPU reaches memory only through the bus, so memory-mapped devices can be added later without changing the CPU.
 - **`src/main.cpp`** is the command-line runner.
 
 ```
@@ -82,12 +85,8 @@ tests/
 
 ## Testing
 
-There are two layers:
-
 1. **Unit tests** (`make test`) assemble a few bytes of machine code, step the CPU, and check registers, flags, memory, and cycle counts.
-2. **The functional test ROM** (`make functional`) runs about 30 million instructions through the core. The ROM signals a failure by jumping to itself, so the runner steps until the program counter stops moving and checks that it stopped at the success address. The ROM is GPL-licensed, so it is downloaded at a pinned commit and verified by checksum instead of being stored in this repository.
-
-Both run on Linux and macOS in CI on every push.
+2. **The functional test ROM** (`make functional`) runs about 30 million instructions through the core. The ROM reports its result through the program counter: a failed check jumps to itself forever, and so does the final success address. The runner steps until the program counter stops moving, then checks where it stopped. The ROM is GPL-licensed, so `make` downloads it at a pinned commit and verifies its checksum instead of storing it in this repository.
 
 ## Limitations
 
