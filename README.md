@@ -89,6 +89,11 @@ tests/
   catch2/catch.hpp                small Catch2-style test header
 ```
 
+Two design choices worth noting:
+
+- **Decimal mode.** `ADC` and `SBC` always compute the plain binary result first, because the overflow flag is defined by it. When the decimal flag is set, a second step corrects each 4-bit digit to produce the BCD result and the carry.
+- **`JAM` opcodes.** On real hardware these twelve opcodes freeze the CPU until it is reset. Here they throw an exception, and the runner reports it and exits. A frozen emulator is hard to debug; an error with the opcode's address is not.
+
 ## Testing
 
 1. **Unit tests** (`make test`) assemble a few bytes of machine code, step the CPU, and check registers, flags, memory, and cycle counts.
