@@ -66,3 +66,11 @@ TEST_CASE("ADC captures overflow timing edges", "[cpu][timing]") {
     REQUIRE((status & kCarryFlag) == 0);
     REQUIRE((status & kOverflowFlag) != 0);
 }
+
+TEST_CASE("Undocumented NOP absolute,X pays page-cross penalty", "[cpu][timing][undocumented]") {
+    Harness harness({0xA2, 0x01, 0x1C, 0xFF, 0x00, 0x1C, 0x00, 0x02, 0x00});
+
+    REQUIRE(step_and_measure(harness) == 2);  // LDX #$01
+    REQUIRE(step_and_measure(harness) == 5);  // NOP $00FF,X (page crosses)
+    REQUIRE(step_and_measure(harness) == 4);  // NOP $0200,X (same page)
+}

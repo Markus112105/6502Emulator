@@ -502,7 +502,7 @@ void CPU::build_dispatch_table() {
 
     set(0x0C, &CPU::op_nop, AddressingMode::Absolute, 4);
     for (const uint8_t opcode : {0x1C, 0x3C, 0x5C, 0x7C, 0xDC, 0xFC}) {
-        set(opcode, &CPU::op_nop, AddressingMode::AbsoluteX, 4);
+        set(opcode, &CPU::op_nop, AddressingMode::AbsoluteX, 4, true);
     }
 
     for (const uint8_t opcode : {0x0B, 0x2B}) {

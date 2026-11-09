@@ -1,116 +1,106 @@
 # 6502 Emulator
 
-6502 Emulator is a cycle-accurate software implementation of the MOS Technology 6502, the CPU that powered platforms such as the NES, Commodore 64, and Apple II. The project emphasises clarity and instructional value while modelling instruction decoding, processor state, addressing modes, and timing behaviour in modern C++.
+[![CI](https://github.com/Markus112105/6502Emulator/actions/workflows/ci.yml/badge.svg)](https://github.com/Markus112105/6502Emulator/actions/workflows/ci.yml)
 
----
+An emulator for the MOS 6502, the 8-bit CPU inside the Apple II, Commodore 64, and NES, written from scratch in C++20 with no dependencies.
 
-## Table of Contents
-- [Project Goals](#project-goals)
-- [Key Features](#key-features)
-- [Architecture Overview](#architecture-overview)
-- [Core Data Structures](#core-data-structures)
-- [Quick Start](#quick-start)
-- [Testing (Optional)](#testing-optional)
-- [Project Layout](#project-layout)
-- [Roadmap](#roadmap)
-- [Further Reading](#further-reading)
+It passes [Klaus Dormann's 6502 functional test](https://github.com/Klaus2m5/6502_65C02_functional_tests), a ROM that checks every documented opcode in every addressing mode, including decimal-mode arithmetic:
 
----
-
-## Project Goals
-- Deliver a faithful, cycle-accurate model of the 6502 CPU.
-- Provide an approachable codebase for learning CPU and emulator design.
-- Separate functional correctness from optional performance optimisations.
-- Supply documentation and tests that explain implementation trade-offs.
-
-## Key Features
-- **Instruction Set Coverage:** Implement all 56 documented instructions across 151 opcodes.
-- **Addressing Modes:** Support every addressing mode with accurate side effects and cycle counts.
-- **Timing Model:** Track per-instruction cycle usage to reflect pipeline and memory latency.
-- **Memory Bus:** Represent the zero page, stack, and program memory through a dedicated bus abstraction.
-- **Decimal & Undocumented Behaviour:** Model BCD arithmetic for `ADC`/`SBC` and surface undocumented opcodes, trapping on `JAM` for safe debugging.
-- **Debug Tooling (Planned):** Provide a disassembler and interactive stepping environment for exploration.
-
-## Architecture Overview
-The emulator is organised around dedicated modules that mirror hardware responsibilities:
-- `cpu.hpp` / `cpu.cpp` implement registers, status flags, and the instruction execution loop.
-- `bus.hpp` / `bus.cpp` route reads and writes between the CPU, RAM, ROM, and peripherals.
-- `main.cpp` initialises the emulator, loads binary programs, and drives the execution cycle.
-
-Supporting modules will capture addressing logic, instruction metadata, and optional debugging interfaces as the project evolves.
-
-## Core Data Structures
-- **Registers:** `A`, `X`, `Y`, `SP`, `PC`, and a packed status register track CPU state.
-- **Memory:** A contiguous 64 KiB space (`std::array<uint8_t, 0x10000>`) models the address bus.
-- **Instruction Table:** A dispatch table links each opcode to its handler, addressing mode, and cycle cost.
-
-## Quick Start
-The emulator builds with any modern C++20 compiler (GCC 10+, Clang 12+, MSVC 2019+). If you are on macOS or Linux, the easiest route is `g++` from the command line; on Windows you can use the same command inside WSL or build with `cl` from the Developer Command Prompt.
-
-1. Open a terminal in the project folder.
-2. Build the emulator with the provided Makefile:
-   ```bash
-   make
-   ```
-   The binary is written to `./emulator`. If you prefer a manual compile, you can still run the `g++` command from the Makefile.
-3. Run a 6502 program (any raw binary) by pointing the emulator at the file:
-   ```bash
-   ./emulator path/to/program.bin [--start 0x8000] [--max-cycles 1000000] [--trace]
-   ```
-
-Helpful flags:
-- `--start` controls the reset vector address if your binary should start somewhere other than `0x8000`.
-- `--max-cycles` adds a safety cut-off so a buggy program does not run forever.
-- `--trace` prints each executed opcode with register updates so you can follow execution.
-
-The emulator exits automatically when the program executes a `BRK` instruction.
-
-### Sample Console Output
 ```
-[Cycle 0x0001] LDA #$01  => A = 0x01
-[Cycle 0x0002] STA $0200 => MEM[0200] = 0x01
-[Cycle 0x0003] BRK       => Halt
+$ make functional
+Trapped at $3469 after 30646177 instructions, 96241367 cycles
+PASS: Klaus Dormann 6502 functional test
 ```
 
-## Testing (Optional)
-The project ships with unit and integration tests powered by the single-header Catch2 runner in `tests/catch2/catch.hpp`.
+## What it does
 
-Build the suite alongside the emulator and run it:
+- All 151 documented opcodes (56 instructions, 13 addressing modes).
+- The undocumented NMOS opcodes as well (`LAX`, `SAX`, `DCP`, `ISC`, `SLO`, `RLA`, `SRE`, `RRA`, and the rest). The twelve `JAM` opcodes raise an error instead of locking up.
+- Cycle counting per instruction, including the extra cycle for page crossings and for taken branches.
+- BCD arithmetic for `ADC` and `SBC` when the decimal flag is set.
+- Hardware quirks that real software depends on, such as the `JMP ($xxFF)` page-wrap bug and zero-page pointer wrapping.
+- A command-line runner that loads a raw binary, executes it, and can trace every instruction.
+
+## Build and run
+
+You need a C++20 compiler (GCC 10+, Clang 12+) and `make`.
+
 ```bash
-make tests
-./cpu_tests
+make                # builds ./emulator
+make test           # unit and timing tests
+make functional     # downloads the functional test ROM once, then runs it
 ```
 
-The Makefile uses `g++` by default; swap the compiler by setting `CXX=clang++ make tests` (or similar) if you prefer another toolchain.
+Try it with a six-instruction program that stores a value and counts X down from 5:
 
-The suite covers instruction semantics, decimal-mode arithmetic, and cycle timing. For extended validation suites (e.g., Klaus Dormann's functional ROM), load the binary with the CLI, note the expected halt condition, and add a new fixture under `tests/` when you're ready to automate it.
-
-## Project Layout
-```
-6502emulator/
-├── src/
-│   ├── bus.cpp
-│   ├── bus.hpp
-│   ├── cpu.cpp
-│   ├── cpu.hpp
-│   └── main.cpp
-├── tests/
-│   ├── cpu_tests.cpp
-│   ├── integration_timing_tests.cpp
-│   ├── catch2/
-│   │   └── catch.hpp
-│   └── support/
-│       └── cpu_harness.hpp
-└── README.md
+```bash
+printf '\xA9\x01\x8D\x00\x02\xA2\x05\xCA\xD0\xFD\x00' > demo.bin
+./emulator demo.bin --trace
 ```
 
-## Roadmap
-- Implement the instruction decoder and opcode handlers.
-- Model each addressing mode and shared micro-operations.
-- Calibrate cycle timings against documented hardware behaviour.
-- Introduce a disassembler and single-step debugging console.
-- Explore optional front-ends such as ImGui timelines or NES cartridge loaders.
+```
+Loaded program: "demo.bin"
+Start address: $8000, cycle budget: 1000000
+[PC=$8000] opcode $A9
+[PC=$8002] opcode $8D
+[PC=$8005] opcode $A2
+[PC=$8007] opcode $CA
+[PC=$8008] opcode $D0
+...
+BRK encountered at $800A after 39 cycles.
+```
 
-## Further Reading
-- [_Programming the 6502_ by Rodnay Zaks](https://archive.org/details/Programming_the_6502) for background on the original processor.
-- [Masswerk 6502 Instruction Set Reference](https://www.masswerk.at/6502/6502_instruction_set.html) for opcode-by-opcode semantics, addressing modes, and cycle counts.
+Options:
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--start <addr>` | `0x8000` | Address the program is loaded at and started from |
+| `--max-cycles <n>` | `1000000` | Stop after this many cycles if the program never reaches `BRK` |
+| `--trace` | off | Print the program counter and opcode of every instruction |
+
+The runner exits with status 0 when the program reaches `BRK`.
+
+## How it works
+
+The code is split the way the hardware is:
+
+- **`src/cpu.cpp`** holds the registers and a 256-entry dispatch table. Each entry pairs an opcode with a handler, an addressing mode, a base cycle count, and whether a page crossing costs an extra cycle. `CPU::step()` fetches one opcode, looks it up, and runs the handler, so each instruction is written once and reused across its addressing modes.
+- **`src/bus.cpp`** owns the 64 KiB address space. The CPU only reaches memory through the bus, which leaves room to add memory-mapped devices without touching the CPU.
+- **`src/main.cpp`** is the command-line runner.
+
+```
+src/
+  cpu.hpp, cpu.cpp      registers, dispatch table, instruction handlers
+  bus.hpp, bus.cpp      64 KiB memory and program loading
+  main.cpp              command-line runner
+tests/
+  cpu_tests.cpp                   instruction behaviour, flags, decimal mode
+  integration_timing_tests.cpp    cycle counts and page-cross penalties
+  functional_rom_test.cpp         runs the Klaus Dormann ROM
+  catch2/catch.hpp                small Catch2-style test header
+```
+
+## Testing
+
+There are two layers:
+
+1. **Unit tests** (`make test`) assemble a few bytes of machine code, step the CPU, and check registers, flags, memory, and cycle counts.
+2. **The functional test ROM** (`make functional`) runs about 30 million instructions through the core. The ROM signals a failure by jumping to itself, so the runner steps until the program counter stops moving and checks that it stopped at the success address. The ROM is GPL-licensed, so it is downloaded at a pinned commit and verified by checksum instead of being stored in this repository.
+
+Both run on Linux and macOS in CI on every push.
+
+## Limitations
+
+- Interrupt lines (`IRQ`, `NMI`) are not modelled yet. `BRK` and `RTI` work.
+- Timing is counted per instruction. The individual bus cycles inside an instruction (dummy reads and writes) are not emulated.
+- The undocumented opcodes are covered by a handful of unit tests, not by a full test ROM.
+
+## References
+
+- [Masswerk 6502 instruction set reference](https://www.masswerk.at/6502/6502_instruction_set.html)
+- [_Programming the 6502_ by Rodnay Zaks](https://archive.org/details/Programming_the_6502)
+- [Klaus Dormann's 6502 functional tests](https://github.com/Klaus2m5/6502_65C02_functional_tests)
+
+## License
+
+[MIT](LICENSE)
