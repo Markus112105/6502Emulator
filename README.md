@@ -1,5 +1,11 @@
 # 6502 Emulator
 
+## What is a 6502?
+
+The 6502 is a computer chip from 1975. A processor chip is the part of a computer that does the actual work: it reads a list of very simple instructions, such as "add these two numbers" or "store this value", and carries them out one at a time. The 6502 did this at a fraction of the price of its competitors, which made home computers and game consoles affordable. It ran the Apple II, the Commodore 64, and the original Nintendo. This project is an emulator: a program that imitates the chip so exactly that software written for a real 6502 runs on a modern computer without knowing the difference.
+
+## Overview
+
 An emulator for the MOS 6502, the 8-bit CPU inside the Apple II, Commodore 64, and NES. Written from scratch in C++20 with no dependencies.
 
 It passes [Klaus Dormann's 6502 functional test](https://github.com/Klaus2m5/6502_65C02_functional_tests), a ROM that checks every documented opcode in every addressing mode, including decimal-mode arithmetic:
