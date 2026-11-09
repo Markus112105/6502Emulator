@@ -10,10 +10,8 @@ namespace emulator {
 class CPU;
 
 // Bus mediates all memory operations between the CPU and the emulated memory
-// map. The current implementation keeps the design intentionally simple: it
-// exposes byte-addressable read/write operations over a fixed 64 KiB address
-// space so functional correctness work can proceed before peripheral devices
-// are introduced.
+// map. The design is intentionally simple: byte-addressable reads and writes
+// over a flat 64 KiB address space, with no memory-mapped devices.
 class Bus {
 public:
     static constexpr std::size_t kAddressSpaceSize = 0x10000;

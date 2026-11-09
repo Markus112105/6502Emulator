@@ -6,7 +6,7 @@ The 6502 is a computer chip from 1975. A processor chip is the part of a compute
 
 ## Overview
 
-An emulator for the MOS 6502, the 8-bit CPU inside the Apple II, Commodore 64, and NES. Written from scratch in C++20 with no dependencies.
+A MOS 6502 emulator written from scratch in C++20, with no dependencies.
 
 It passes [Klaus Dormann's 6502 functional test](https://github.com/Klaus2m5/6502_65C02_functional_tests), a ROM that checks every documented opcode in every addressing mode, including decimal-mode arithmetic:
 

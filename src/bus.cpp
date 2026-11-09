@@ -13,10 +13,8 @@ void Bus::attach_cpu(CPU* cpu) {
 }
 
 uint8_t Bus::read(uint16_t address) const {
-    // Out-of-bounds access is clamped so early bring-up can concentrate on CPU
-    // logic without undefined behaviour; later we can route such cases to
-    // device-specific handlers or trap mechanisms.
-    return memory_[address % kAddressSpaceSize];
+    // Every 16-bit address is valid: the whole 64 KiB space is backed by RAM.
+    return memory_[address];
 }
 
 uint16_t Bus::read16(uint16_t address) const {
@@ -28,7 +26,7 @@ uint16_t Bus::read16(uint16_t address) const {
 }
 
 void Bus::write(uint16_t address, uint8_t value) {
-    memory_[address % kAddressSpaceSize] = value;
+    memory_[address] = value;
 }
 
 void Bus::load_memory(const std::array<uint8_t, kAddressSpaceSize>& image) {
@@ -36,8 +34,7 @@ void Bus::load_memory(const std::array<uint8_t, kAddressSpaceSize>& image) {
 }
 
 void Bus::load_program(uint16_t start_address, std::span<const uint8_t> program_bytes) {
-    // Sequentially copy the program into memory; later we can extend this to
-    // model mirrored regions and device-specific behaviour.
+    // Copy the program into memory, wrapping at the top of the address space.
     for (std::size_t index = 0; index < program_bytes.size(); ++index) {
         write(static_cast<uint16_t>(start_address + index), program_bytes[index]);
     }
