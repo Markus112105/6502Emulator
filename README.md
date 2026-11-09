@@ -27,7 +27,7 @@ PASS: Klaus Dormann 6502 functional test
 
 ## Build and run
 
-You need a C++20 compiler (GCC 10+, Clang 12+) and `make`.
+You need a C++20 compiler (GCC 11+, Clang 13+) and `make`.
 
 ```bash
 make                # builds ./emulator
@@ -54,12 +54,13 @@ printf '\xA9\x01\x8D\x00\x02\xA2\x05\xCA\xD0\xFD\x00' > demo.bin
 ```
 Loaded program: "demo.bin"
 Start address: $8000, cycle budget: 1000000
-[PC=$8000] opcode $A9
-[PC=$8002] opcode $8D
-[PC=$8005] opcode $A2
-[PC=$8007] opcode $CA
-[PC=$8008] opcode $D0
+$8000  LDA  A=01 X=00 Y=00 SP=FD P=24  cycles=2
+$8002  STA  A=01 X=00 Y=00 SP=FD P=24  cycles=6
+$8005  LDX  A=01 X=05 Y=00 SP=FD P=24  cycles=8
+$8007  DEX  A=01 X=04 Y=00 SP=FD P=24  cycles=10
+$8008  BNE  A=01 X=04 Y=00 SP=FD P=24  cycles=13
 ...
+$800A  BRK  A=01 X=00 Y=00 SP=FA P=26  cycles=39
 BRK encountered at $800A after 39 cycles.
 ```
 
@@ -67,26 +68,27 @@ BRK encountered at $800A after 39 cycles.
 | --- | --- | --- |
 | `--start <addr>` | `0x8000` | Address the program is loaded at and started from |
 | `--max-cycles <n>` | `1000000` | Stop after this many cycles if the program never reaches `BRK` |
-| `--trace` | off | Print the program counter and opcode of every instruction |
+| `--trace` | off | Print each instruction with the register values and cycle count after it runs |
 
 The runner stops at the first `BRK` and exits with status 0.
 
 ## How it works
 
-- **`src/cpu.cpp`** holds the registers and a 256-entry dispatch table. Each entry pairs an opcode with a handler, an addressing mode, a base cycle count, and whether a page crossing costs an extra cycle. `CPU::step()` fetches one opcode, looks it up, and runs the handler. Each instruction is written once and shared by all of its addressing modes.
+- **`src/cpu.cpp`** is table-driven. A 256-entry table gives every opcode a handler, an addressing mode, a cycle count, and whether crossing a page costs an extra cycle. `CPU::step()` fetches one opcode, looks it up, and runs the handler.
+- Each instruction is written once. `LDA` has eight opcodes, one per addressing mode, but a single handler: `operand_address()` works out where the operand lives, and the handler does the rest. The shifts, rotates, increments, and decrements share one read-modify-write helper, which the undocumented opcodes reuse (`SLO` is a shift followed by an OR).
 - **`src/bus.cpp`** owns the 64 KiB address space. The CPU reaches memory only through the bus, so memory-mapped devices can be added later without changing the CPU.
 - **`src/main.cpp`** is the command-line runner.
 
 ```
 src/
-  cpu.hpp, cpu.cpp      registers, dispatch table, instruction handlers
+  cpu.hpp, cpu.cpp      registers, opcode table, instruction handlers
   bus.hpp, bus.cpp      64 KiB memory and program loading
   main.cpp              command-line runner
 tests/
   cpu_tests.cpp                   instruction behaviour, flags, decimal mode
   integration_timing_tests.cpp    cycle counts and page-cross penalties
   functional_rom_test.cpp         runs the Klaus Dormann ROM
-  catch2/catch.hpp                small Catch2-style test header
+  support/                        test harness and a minimal test framework
 ```
 
 Two design choices worth noting:

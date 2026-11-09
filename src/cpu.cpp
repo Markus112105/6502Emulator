@@ -1,1230 +1,1049 @@
 #include "cpu.hpp"
 
+#include <initializer_list>
 #include <stdexcept>
-#include <string>
 
 #include "bus.hpp"
 
 namespace emulator {
 
 namespace {
-constexpr uint16_t kStackBase = 0x0100;
-constexpr uint8_t kBreakMask = static_cast<uint8_t>(CPU::StatusFlag::Break);
-constexpr uint8_t kUnusedMask = static_cast<uint8_t>(CPU::StatusFlag::Unused);
-}  // namespace
 
-CPU::CPU() {
-    build_dispatch_table();
+constexpr uint16_t kStackPage = 0x0100;
+constexpr uint16_t kResetVector = 0xFFFC;
+constexpr uint16_t kInterruptVector = 0xFFFE;
+
+constexpr uint8_t bit(CPU::StatusFlag flag) {
+    return static_cast<uint8_t>(flag);
 }
 
-void CPU::attach_bus(Bus* bus) {
-    bus_ = bus;
+// SHA, SHX, SHY and SHS store a register ANDed with this odd value: the high
+// byte of the target address, plus one.
+constexpr uint8_t high_byte_plus_one(uint16_t address) {
+    return static_cast<uint8_t>((address >> 8) + 1);
+}
+
+}  // namespace
+
+CPU::CPU(Bus& bus) : bus_(bus) {
+    build_instruction_table();
 }
 
 void CPU::reset() {
-    // Reset aligns with the 6502 power-on sequence so that software relying on
-    // the reset vector and status flag defaults behaves as expected.
     registers_ = Registers{};
-    registers_.status = static_cast<uint8_t>((registers_.status & ~kBreakMask) | kUnusedMask);
-
-    if (bus_ != nullptr) {
-        const uint8_t low = bus_->read(0xFFFC);
-        const uint8_t high = bus_->read(0xFFFD);
-        registers_.program_counter = static_cast<uint16_t>((static_cast<uint16_t>(high) << 8) | low);
-    } else {
-        registers_.program_counter = 0x0000;
-    }
-
+    registers_.program_counter = read_word(kResetVector);
     cycles_ = 0;
 }
 
 void CPU::step() {
-    if (bus_ == nullptr) {
-        return;
+    const Instruction& instruction = instructions_[fetch_byte()];
+
+    page_crossed_ = false;
+    (this->*instruction.handler)(instruction.mode);
+
+    cycles_ += instruction.cycles;
+    if (instruction.page_cross_penalty && page_crossed_) {
+        cycles_ += 1;
     }
-
-    const uint8_t opcode = fetch_byte();
-    execute_instruction(opcode);
 }
 
-uint8_t CPU::fetch_byte() {
-    const uint8_t value = bus_->read(registers_.program_counter);
-    registers_.program_counter = static_cast<uint16_t>(registers_.program_counter + 1);
-    return value;
-}
-
-uint16_t CPU::fetch_word() {
-    const uint16_t low = fetch_byte();
-    const uint16_t high = fetch_byte();
-    return static_cast<uint16_t>((high << 8) | low);
-}
+// ---------------------------------------------------------------------------
+// Memory access
+// ---------------------------------------------------------------------------
 
 uint8_t CPU::read(uint16_t address) const {
-    return bus_->read(address);
+    return bus_.read(address);
 }
 
 void CPU::write(uint16_t address, uint8_t value) {
-    bus_->write(address, value);
+    bus_.write(address, value);
 }
+
+uint8_t CPU::fetch_byte() {
+    return read(registers_.program_counter++);
+}
+
+uint16_t CPU::fetch_word() {
+    const uint8_t low = fetch_byte();
+    const uint8_t high = fetch_byte();
+    return static_cast<uint16_t>(high << 8 | low);
+}
+
+// Reads a little-endian 16-bit value. When the 6502 steps from the low byte to
+// the high byte it never carries into the upper half of the pointer, so a
+// pointer at $12FF takes its high byte from $1200, not $1300. This one rule
+// produces both the well-known JMP ($xxFF) bug and the wrap-around of
+// zero-page pointers.
+uint16_t CPU::read_word(uint16_t pointer) const {
+    const uint16_t next = static_cast<uint16_t>((pointer & 0xFF00) | ((pointer + 1) & 0x00FF));
+    return static_cast<uint16_t>(read(next) << 8 | read(pointer));
+}
+
+// ---------------------------------------------------------------------------
+// Stack: lives in page $01 and grows downwards.
+// ---------------------------------------------------------------------------
 
 void CPU::push(uint8_t value) {
-    const uint16_t address = static_cast<uint16_t>(kStackBase | registers_.stack_pointer);
-    write(address, value);
-    registers_.stack_pointer = static_cast<uint8_t>(registers_.stack_pointer - 1);
+    write(kStackPage + registers_.stack_pointer, value);
+    registers_.stack_pointer--;
 }
 
-void CPU::push16(uint16_t value) {
-    push(static_cast<uint8_t>((value >> 8) & 0x00FF));
-    push(static_cast<uint8_t>(value & 0x00FF));
+void CPU::push_word(uint16_t value) {
+    push(static_cast<uint8_t>(value >> 8));
+    push(static_cast<uint8_t>(value & 0xFF));
 }
 
 uint8_t CPU::pull() {
-    registers_.stack_pointer = static_cast<uint8_t>(registers_.stack_pointer + 1);
-    const uint16_t address = static_cast<uint16_t>(kStackBase | registers_.stack_pointer);
-    return read(address);
+    registers_.stack_pointer++;
+    return read(kStackPage + registers_.stack_pointer);
 }
 
-uint16_t CPU::pull16() {
-    const uint16_t low = pull();
-    const uint16_t high = pull();
-    return static_cast<uint16_t>((high << 8) | low);
+uint16_t CPU::pull_word() {
+    const uint8_t low = pull();
+    const uint8_t high = pull();
+    return static_cast<uint16_t>(high << 8 | low);
 }
 
-void CPU::consume_operand(AddressingMode mode) {
+// The Break flag is not a real bit in the register. It only exists in the copy
+// of the status byte that PHP and BRK push, and is dropped again on the way
+// back in.
+void CPU::push_status() {
+    push(registers_.status | bit(Break) | bit(Unused));
+}
+
+void CPU::pull_status() {
+    registers_.status = static_cast<uint8_t>((pull() & ~bit(Break)) | bit(Unused));
+}
+
+// ---------------------------------------------------------------------------
+// Operands
+// ---------------------------------------------------------------------------
+
+// Adds an index or branch offset to an address and records whether the result
+// landed in a different 256-byte page, which costs some instructions a cycle.
+uint16_t CPU::offset_address(uint16_t base, int offset) {
+    const uint16_t address = static_cast<uint16_t>(base + offset);
+    if ((address & 0xFF00) != (base & 0xFF00)) {
+        page_crossed_ = true;
+    }
+    return address;
+}
+
+// Consumes the operand bytes that follow the opcode and returns the address
+// the instruction should work on.
+uint16_t CPU::operand_address(AddressingMode mode) {
     switch (mode) {
-        case AddressingMode::Accumulator:
-        case AddressingMode::Implied:
-            return;
-        case AddressingMode::Immediate:
-        case AddressingMode::Relative:
-            fetch_byte();
-            return;
-        default: {
-            bool page_crossed = false;
-            compute_address(mode, page_crossed);
-            page_crossed_ = page_crossed_ || page_crossed;
-            return;
+        case Immediate:
+            return registers_.program_counter++;
+        case ZeroPage:
+            return fetch_byte();
+        case ZeroPageX:
+            return static_cast<uint8_t>(fetch_byte() + registers_.x);  // Wraps within page zero.
+        case ZeroPageY:
+            return static_cast<uint8_t>(fetch_byte() + registers_.y);
+        case Absolute:
+            return fetch_word();
+        case AbsoluteX:
+            return offset_address(fetch_word(), registers_.x);
+        case AbsoluteY:
+            return offset_address(fetch_word(), registers_.y);
+        case Indirect:
+            return read_word(fetch_word());
+        case IndexedIndirect:
+            return read_word(static_cast<uint8_t>(fetch_byte() + registers_.x));
+        case IndirectIndexed:
+            return offset_address(read_word(fetch_byte()), registers_.y);
+        case Relative: {
+            const int8_t offset = static_cast<int8_t>(fetch_byte());
+            return offset_address(registers_.program_counter, offset);
         }
+        case Implied:
+        case Accumulator:
+            break;
     }
+    return 0;  // Implied and Accumulator instructions have no address.
 }
 
-void CPU::adc(uint8_t operand) {
-    const uint8_t accumulator = registers_.accumulator;
-    const uint16_t carry_in = flag(StatusFlag::Carry) ? 1 : 0;
-    const uint16_t binary_sum = static_cast<uint16_t>(accumulator) + operand + carry_in;
-    uint16_t adjusted_sum = binary_sum;
-    const bool decimal_mode = flag(StatusFlag::Decimal);
-
-    if (decimal_mode) {
-        if (((accumulator & 0x0F) + (operand & 0x0F) + carry_in) > 0x09) {
-            adjusted_sum += 0x06;
-        }
-        if (adjusted_sum > 0x99) {
-            adjusted_sum += 0x60;
-        }
-    }
-
-    const uint8_t binary_result = static_cast<uint8_t>(binary_sum & 0xFF);
-    set_flag(StatusFlag::Overflow,
-             (~(accumulator ^ operand) & (accumulator ^ binary_result) & 0x80) != 0);
-
-    set_flag(StatusFlag::Carry, decimal_mode ? (adjusted_sum > 0x99) : (binary_sum > 0xFF));
-
-    const uint8_t result = static_cast<uint8_t>(adjusted_sum & 0xFF);
-    registers_.accumulator = result;
-    update_zero_and_negative(result);
+uint8_t CPU::read_operand(AddressingMode mode) {
+    return mode == Accumulator ? registers_.accumulator : read(operand_address(mode));
 }
 
-void CPU::sbc(uint8_t operand) {
-    const uint8_t accumulator = registers_.accumulator;
-    const uint16_t carry_in = flag(StatusFlag::Carry) ? 1 : 0;
-    const uint16_t value = static_cast<uint16_t>(operand) ^ 0x00FF;
-    const uint16_t binary_sum = static_cast<uint16_t>(accumulator) + value + carry_in;
-    const uint8_t binary_result = static_cast<uint8_t>(binary_sum & 0xFF);
-    const bool decimal_mode = flag(StatusFlag::Decimal);
-
-    uint8_t result = binary_result;
-    if (decimal_mode) {
-        int low = static_cast<int>(accumulator & 0x0F) - static_cast<int>(operand & 0x0F) - static_cast<int>(carry_in ? 0 : 1);
-        int borrow = 0;
-        if (low < 0) {
-            low += 10;
-            borrow = 1;
-        }
-
-        int high = static_cast<int>((accumulator >> 4) & 0x0F) - static_cast<int>((operand >> 4) & 0x0F) - borrow;
-        int carry_out = 1;
-        if (high < 0) {
-            high += 10;
-            carry_out = 0;
-        }
-
-        result = static_cast<uint8_t>((static_cast<uint8_t>(high) << 4) | static_cast<uint8_t>(low & 0x0F));
-        set_flag(StatusFlag::Carry, carry_out != 0);
-    } else {
-        set_flag(StatusFlag::Carry, binary_sum > 0xFF);
+// Read-modify-write: runs `operation` on the operand, stores the result back
+// where it came from (the accumulator or memory), and returns it.
+uint8_t CPU::modify_operand(AddressingMode mode, uint8_t (CPU::*operation)(uint8_t)) {
+    if (mode == Accumulator) {
+        registers_.accumulator = (this->*operation)(registers_.accumulator);
+        return registers_.accumulator;
     }
 
-    set_flag(StatusFlag::Overflow,
-             ((accumulator ^ binary_result) & (accumulator ^ operand) & 0x80) != 0);
-
-    registers_.accumulator = result;
-    update_zero_and_negative(result);
+    const uint16_t address = operand_address(mode);
+    const uint8_t result = (this->*operation)(read(address));
+    write(address, result);
+    return result;
 }
+
+// ---------------------------------------------------------------------------
+// Flags
+// ---------------------------------------------------------------------------
 
 bool CPU::flag(StatusFlag flag) const {
-    return (registers_.status & static_cast<uint8_t>(flag)) != 0;
+    return (registers_.status & bit(flag)) != 0;
 }
 
 void CPU::set_flag(StatusFlag flag, bool value) {
     if (value) {
-        registers_.status |= static_cast<uint8_t>(flag);
+        registers_.status |= bit(flag);
     } else {
-        registers_.status &= ~static_cast<uint8_t>(flag);
+        registers_.status &= ~bit(flag);
     }
 }
 
 void CPU::update_zero_and_negative(uint8_t value) {
-    set_flag(StatusFlag::Zero, value == 0);
-    set_flag(StatusFlag::Negative, (value & 0x80) != 0);
+    set_flag(Zero, value == 0);
+    set_flag(Negative, (value & 0x80) != 0);
 }
 
-uint16_t CPU::compute_address(AddressingMode mode, bool& page_crossed) {
-    page_crossed = false;
-
-    switch (mode) {
-        case AddressingMode::Immediate:
-            return registers_.program_counter++;
-        case AddressingMode::ZeroPage:
-            return static_cast<uint16_t>(fetch_byte());
-        case AddressingMode::ZeroPageX: {
-            const uint8_t base = fetch_byte();
-            return static_cast<uint16_t>(static_cast<uint8_t>(base + registers_.x));
-        }
-        case AddressingMode::ZeroPageY: {
-            const uint8_t base = fetch_byte();
-            return static_cast<uint16_t>(static_cast<uint8_t>(base + registers_.y));
-        }
-        case AddressingMode::Absolute:
-            return fetch_word();
-        case AddressingMode::AbsoluteX: {
-            const uint16_t base = fetch_word();
-            const uint16_t address = static_cast<uint16_t>(base + registers_.x);
-            page_crossed = (base & 0xFF00) != (address & 0xFF00);
-            return address;
-        }
-        case AddressingMode::AbsoluteY: {
-            const uint16_t base = fetch_word();
-            const uint16_t address = static_cast<uint16_t>(base + registers_.y);
-            page_crossed = (base & 0xFF00) != (address & 0xFF00);
-            return address;
-        }
-        case AddressingMode::Indirect: {
-            const uint16_t pointer = fetch_word();
-            const uint8_t low = read(pointer);
-            const uint8_t high = read(static_cast<uint16_t>((pointer & 0xFF00) | ((pointer + 1) & 0x00FF)));
-            return static_cast<uint16_t>((static_cast<uint16_t>(high) << 8) | low);
-        }
-        case AddressingMode::IndexedIndirect: {
-            const uint8_t base = static_cast<uint8_t>(fetch_byte() + registers_.x);
-            const uint8_t low = read(static_cast<uint16_t>(base));
-            const uint8_t high = read(static_cast<uint16_t>((base + 1) & 0x00FF));
-            return static_cast<uint16_t>((static_cast<uint16_t>(high) << 8) | low);
-        }
-        case AddressingMode::IndirectIndexed: {
-            const uint8_t base = fetch_byte();
-            const uint8_t low = read(static_cast<uint16_t>(base));
-            const uint8_t high = read(static_cast<uint16_t>((base + 1) & 0x00FF));
-            const uint16_t pointer = static_cast<uint16_t>((static_cast<uint16_t>(high) << 8) | low);
-            const uint16_t address = static_cast<uint16_t>(pointer + registers_.y);
-            page_crossed = (pointer & 0xFF00) != (address & 0xFF00);
-            return address;
-        }
-        case AddressingMode::Relative: {
-            const int8_t offset = static_cast<int8_t>(fetch_byte());
-            const uint16_t current = registers_.program_counter;
-            const uint16_t target = static_cast<uint16_t>(current + offset);
-            page_crossed = (current & 0xFF00) != (target & 0xFF00);
-            return target;
-        }
-        case AddressingMode::Accumulator:
-        case AddressingMode::Implied:
-            break;
-    }
-
-    return 0;
-}
-
-uint8_t CPU::read_operand(AddressingMode mode, bool& page_crossed) {
-    switch (mode) {
-        case AddressingMode::Accumulator:
-            page_crossed = false;
-            return registers_.accumulator;
-        case AddressingMode::Immediate:
-            page_crossed = false;
-            return fetch_byte();
-        case AddressingMode::Implied:
-            page_crossed = false;
-            return 0;
-        default: {
-            const uint16_t address = compute_address(mode, page_crossed);
-            page_crossed_ = page_crossed_ || page_crossed;
-            return read(address);
-        }
-    }
-}
-
-void CPU::build_dispatch_table() {
-    // Default every descriptor to an illegal instruction trap so unsupported
-    // opcodes are surfaced immediately during development.
-    for (auto& descriptor : dispatch_table_) {
-        descriptor.handler = nullptr;
-        descriptor.mode = AddressingMode::Implied;
-        descriptor.cycles = 0;
-        descriptor.page_cross_cycle = false;
-    }
-
-    auto set = [this](uint8_t opcode, InstructionDescriptor::Handler handler,
-                      AddressingMode mode, uint8_t cycles, bool page_cross_extra = false) {
-        auto& descriptor = dispatch_table_[opcode];
-        descriptor.handler = handler;
-        descriptor.mode = mode;
-        descriptor.cycles = cycles;
-        descriptor.page_cross_cycle = page_cross_extra;
-    };
-
-    // --- Load/Store ---
-    set(0xA9, &CPU::op_lda, AddressingMode::Immediate, 2);
-    set(0xA5, &CPU::op_lda, AddressingMode::ZeroPage, 3);
-    set(0xB5, &CPU::op_lda, AddressingMode::ZeroPageX, 4);
-    set(0xAD, &CPU::op_lda, AddressingMode::Absolute, 4);
-    set(0xBD, &CPU::op_lda, AddressingMode::AbsoluteX, 4, true);
-    set(0xB9, &CPU::op_lda, AddressingMode::AbsoluteY, 4, true);
-    set(0xA1, &CPU::op_lda, AddressingMode::IndexedIndirect, 6);
-    set(0xB1, &CPU::op_lda, AddressingMode::IndirectIndexed, 5, true);
-
-    set(0xA2, &CPU::op_ldx, AddressingMode::Immediate, 2);
-    set(0xA6, &CPU::op_ldx, AddressingMode::ZeroPage, 3);
-    set(0xB6, &CPU::op_ldx, AddressingMode::ZeroPageY, 4);
-    set(0xAE, &CPU::op_ldx, AddressingMode::Absolute, 4);
-    set(0xBE, &CPU::op_ldx, AddressingMode::AbsoluteY, 4, true);
-
-    set(0xA0, &CPU::op_ldy, AddressingMode::Immediate, 2);
-    set(0xA4, &CPU::op_ldy, AddressingMode::ZeroPage, 3);
-    set(0xB4, &CPU::op_ldy, AddressingMode::ZeroPageX, 4);
-    set(0xAC, &CPU::op_ldy, AddressingMode::Absolute, 4);
-    set(0xBC, &CPU::op_ldy, AddressingMode::AbsoluteX, 4, true);
-
-    set(0x85, &CPU::op_sta, AddressingMode::ZeroPage, 3);
-    set(0x95, &CPU::op_sta, AddressingMode::ZeroPageX, 4);
-    set(0x8D, &CPU::op_sta, AddressingMode::Absolute, 4);
-    set(0x9D, &CPU::op_sta, AddressingMode::AbsoluteX, 5);
-    set(0x99, &CPU::op_sta, AddressingMode::AbsoluteY, 5);
-    set(0x81, &CPU::op_sta, AddressingMode::IndexedIndirect, 6);
-    set(0x91, &CPU::op_sta, AddressingMode::IndirectIndexed, 6);
-
-    set(0x86, &CPU::op_stx, AddressingMode::ZeroPage, 3);
-    set(0x96, &CPU::op_stx, AddressingMode::ZeroPageY, 4);
-    set(0x8E, &CPU::op_stx, AddressingMode::Absolute, 4);
-
-    set(0x84, &CPU::op_sty, AddressingMode::ZeroPage, 3);
-    set(0x94, &CPU::op_sty, AddressingMode::ZeroPageX, 4);
-    set(0x8C, &CPU::op_sty, AddressingMode::Absolute, 4);
-
-    // --- Arithmetic / Logic ---
-    set(0x69, &CPU::op_adc, AddressingMode::Immediate, 2);
-    set(0x65, &CPU::op_adc, AddressingMode::ZeroPage, 3);
-    set(0x75, &CPU::op_adc, AddressingMode::ZeroPageX, 4);
-    set(0x6D, &CPU::op_adc, AddressingMode::Absolute, 4);
-    set(0x7D, &CPU::op_adc, AddressingMode::AbsoluteX, 4, true);
-    set(0x79, &CPU::op_adc, AddressingMode::AbsoluteY, 4, true);
-    set(0x61, &CPU::op_adc, AddressingMode::IndexedIndirect, 6);
-    set(0x71, &CPU::op_adc, AddressingMode::IndirectIndexed, 5, true);
-
-    set(0xE9, &CPU::op_sbc, AddressingMode::Immediate, 2);
-    set(0xE5, &CPU::op_sbc, AddressingMode::ZeroPage, 3);
-    set(0xF5, &CPU::op_sbc, AddressingMode::ZeroPageX, 4);
-    set(0xED, &CPU::op_sbc, AddressingMode::Absolute, 4);
-    set(0xFD, &CPU::op_sbc, AddressingMode::AbsoluteX, 4, true);
-    set(0xF9, &CPU::op_sbc, AddressingMode::AbsoluteY, 4, true);
-    set(0xE1, &CPU::op_sbc, AddressingMode::IndexedIndirect, 6);
-    set(0xF1, &CPU::op_sbc, AddressingMode::IndirectIndexed, 5, true);
-
-    set(0x29, &CPU::op_and, AddressingMode::Immediate, 2);
-    set(0x25, &CPU::op_and, AddressingMode::ZeroPage, 3);
-    set(0x35, &CPU::op_and, AddressingMode::ZeroPageX, 4);
-    set(0x2D, &CPU::op_and, AddressingMode::Absolute, 4);
-    set(0x3D, &CPU::op_and, AddressingMode::AbsoluteX, 4, true);
-    set(0x39, &CPU::op_and, AddressingMode::AbsoluteY, 4, true);
-    set(0x21, &CPU::op_and, AddressingMode::IndexedIndirect, 6);
-    set(0x31, &CPU::op_and, AddressingMode::IndirectIndexed, 5, true);
-
-    set(0x09, &CPU::op_ora, AddressingMode::Immediate, 2);
-    set(0x05, &CPU::op_ora, AddressingMode::ZeroPage, 3);
-    set(0x15, &CPU::op_ora, AddressingMode::ZeroPageX, 4);
-    set(0x0D, &CPU::op_ora, AddressingMode::Absolute, 4);
-    set(0x1D, &CPU::op_ora, AddressingMode::AbsoluteX, 4, true);
-    set(0x19, &CPU::op_ora, AddressingMode::AbsoluteY, 4, true);
-    set(0x01, &CPU::op_ora, AddressingMode::IndexedIndirect, 6);
-    set(0x11, &CPU::op_ora, AddressingMode::IndirectIndexed, 5, true);
-
-    set(0x49, &CPU::op_eor, AddressingMode::Immediate, 2);
-    set(0x45, &CPU::op_eor, AddressingMode::ZeroPage, 3);
-    set(0x55, &CPU::op_eor, AddressingMode::ZeroPageX, 4);
-    set(0x4D, &CPU::op_eor, AddressingMode::Absolute, 4);
-    set(0x5D, &CPU::op_eor, AddressingMode::AbsoluteX, 4, true);
-    set(0x59, &CPU::op_eor, AddressingMode::AbsoluteY, 4, true);
-    set(0x41, &CPU::op_eor, AddressingMode::IndexedIndirect, 6);
-    set(0x51, &CPU::op_eor, AddressingMode::IndirectIndexed, 5, true);
-
-    set(0xC9, &CPU::op_cmp, AddressingMode::Immediate, 2);
-    set(0xC5, &CPU::op_cmp, AddressingMode::ZeroPage, 3);
-    set(0xD5, &CPU::op_cmp, AddressingMode::ZeroPageX, 4);
-    set(0xCD, &CPU::op_cmp, AddressingMode::Absolute, 4);
-    set(0xDD, &CPU::op_cmp, AddressingMode::AbsoluteX, 4, true);
-    set(0xD9, &CPU::op_cmp, AddressingMode::AbsoluteY, 4, true);
-    set(0xC1, &CPU::op_cmp, AddressingMode::IndexedIndirect, 6);
-    set(0xD1, &CPU::op_cmp, AddressingMode::IndirectIndexed, 5, true);
-
-    set(0xE0, &CPU::op_cpx, AddressingMode::Immediate, 2);
-    set(0xE4, &CPU::op_cpx, AddressingMode::ZeroPage, 3);
-    set(0xEC, &CPU::op_cpx, AddressingMode::Absolute, 4);
-
-    set(0xC0, &CPU::op_cpy, AddressingMode::Immediate, 2);
-    set(0xC4, &CPU::op_cpy, AddressingMode::ZeroPage, 3);
-    set(0xCC, &CPU::op_cpy, AddressingMode::Absolute, 4);
-
-    set(0x24, &CPU::op_bit, AddressingMode::ZeroPage, 3);
-    set(0x2C, &CPU::op_bit, AddressingMode::Absolute, 4);
-
-    // --- Increment / Decrement ---
-    set(0xE6, &CPU::op_inc, AddressingMode::ZeroPage, 5);
-    set(0xF6, &CPU::op_inc, AddressingMode::ZeroPageX, 6);
-    set(0xEE, &CPU::op_inc, AddressingMode::Absolute, 6);
-    set(0xFE, &CPU::op_inc, AddressingMode::AbsoluteX, 7);
-
-    set(0xC6, &CPU::op_dec, AddressingMode::ZeroPage, 5);
-    set(0xD6, &CPU::op_dec, AddressingMode::ZeroPageX, 6);
-    set(0xCE, &CPU::op_dec, AddressingMode::Absolute, 6);
-    set(0xDE, &CPU::op_dec, AddressingMode::AbsoluteX, 7);
-
-    set(0xE8, &CPU::op_inx, AddressingMode::Implied, 2);
-    set(0xC8, &CPU::op_iny, AddressingMode::Implied, 2);
-    set(0xCA, &CPU::op_dex, AddressingMode::Implied, 2);
-    set(0x88, &CPU::op_dey, AddressingMode::Implied, 2);
-
-    // --- Shift / Rotate ---
-    set(0x0A, &CPU::op_asl, AddressingMode::Accumulator, 2);
-    set(0x06, &CPU::op_asl, AddressingMode::ZeroPage, 5);
-    set(0x16, &CPU::op_asl, AddressingMode::ZeroPageX, 6);
-    set(0x0E, &CPU::op_asl, AddressingMode::Absolute, 6);
-    set(0x1E, &CPU::op_asl, AddressingMode::AbsoluteX, 7);
-
-    set(0x4A, &CPU::op_lsr, AddressingMode::Accumulator, 2);
-    set(0x46, &CPU::op_lsr, AddressingMode::ZeroPage, 5);
-    set(0x56, &CPU::op_lsr, AddressingMode::ZeroPageX, 6);
-    set(0x4E, &CPU::op_lsr, AddressingMode::Absolute, 6);
-    set(0x5E, &CPU::op_lsr, AddressingMode::AbsoluteX, 7);
-
-    set(0x2A, &CPU::op_rol, AddressingMode::Accumulator, 2);
-    set(0x26, &CPU::op_rol, AddressingMode::ZeroPage, 5);
-    set(0x36, &CPU::op_rol, AddressingMode::ZeroPageX, 6);
-    set(0x2E, &CPU::op_rol, AddressingMode::Absolute, 6);
-    set(0x3E, &CPU::op_rol, AddressingMode::AbsoluteX, 7);
-
-    set(0x6A, &CPU::op_ror, AddressingMode::Accumulator, 2);
-    set(0x66, &CPU::op_ror, AddressingMode::ZeroPage, 5);
-    set(0x76, &CPU::op_ror, AddressingMode::ZeroPageX, 6);
-    set(0x6E, &CPU::op_ror, AddressingMode::Absolute, 6);
-    set(0x7E, &CPU::op_ror, AddressingMode::AbsoluteX, 7);
-
-    // --- Branches ---
-    set(0x10, &CPU::op_bpl, AddressingMode::Relative, 2);
-    set(0x30, &CPU::op_bmi, AddressingMode::Relative, 2);
-    set(0x50, &CPU::op_bvc, AddressingMode::Relative, 2);
-    set(0x70, &CPU::op_bvs, AddressingMode::Relative, 2);
-    set(0x90, &CPU::op_bcc, AddressingMode::Relative, 2);
-    set(0xB0, &CPU::op_bcs, AddressingMode::Relative, 2);
-    set(0xD0, &CPU::op_bne, AddressingMode::Relative, 2);
-    set(0xF0, &CPU::op_beq, AddressingMode::Relative, 2);
-
-    // --- Transfer / Stack ---
-    set(0xAA, &CPU::op_tax, AddressingMode::Implied, 2);
-    set(0xA8, &CPU::op_tay, AddressingMode::Implied, 2);
-    set(0x8A, &CPU::op_txa, AddressingMode::Implied, 2);
-    set(0x98, &CPU::op_tya, AddressingMode::Implied, 2);
-    set(0xBA, &CPU::op_tsx, AddressingMode::Implied, 2);
-    set(0x9A, &CPU::op_txs, AddressingMode::Implied, 2);
-
-    set(0x48, &CPU::op_pha, AddressingMode::Implied, 3);
-    set(0x08, &CPU::op_php, AddressingMode::Implied, 3);
-    set(0x68, &CPU::op_pla, AddressingMode::Implied, 4);
-    set(0x28, &CPU::op_plp, AddressingMode::Implied, 4);
-
-    // --- Status ---
-    set(0x18, &CPU::op_clc, AddressingMode::Implied, 2);
-    set(0x38, &CPU::op_sec, AddressingMode::Implied, 2);
-    set(0x58, &CPU::op_cli, AddressingMode::Implied, 2);
-    set(0x78, &CPU::op_sei, AddressingMode::Implied, 2);
-    set(0xB8, &CPU::op_clv, AddressingMode::Implied, 2);
-    set(0xD8, &CPU::op_cld, AddressingMode::Implied, 2);
-    set(0xF8, &CPU::op_sed, AddressingMode::Implied, 2);
-
-    // --- Control ---
-    set(0x00, &CPU::op_brk, AddressingMode::Implied, 7);
-    set(0xEA, &CPU::op_nop, AddressingMode::Implied, 2);
-    set(0x4C, &CPU::op_jmp, AddressingMode::Absolute, 3);
-    set(0x6C, &CPU::op_jmp, AddressingMode::Indirect, 5);
-    set(0x20, &CPU::op_jsr, AddressingMode::Absolute, 6);
-    set(0x40, &CPU::op_rti, AddressingMode::Implied, 6);
-    set(0x60, &CPU::op_rts, AddressingMode::Implied, 6);
-
-    // --- Undocumented operations ---
-    for (const uint8_t opcode : {0x02, 0x12, 0x22, 0x32, 0x42, 0x52, 0x62, 0x72, 0x92, 0xB2, 0xD2, 0xF2}) {
-        set(opcode, &CPU::op_jam, AddressingMode::Implied, 0);
-    }
-
-    for (const uint8_t opcode : {0x1A, 0x3A, 0x5A, 0x7A, 0xDA, 0xFA}) {
-        set(opcode, &CPU::op_nop, AddressingMode::Implied, 2);
-    }
-
-    for (const uint8_t opcode : {0x80, 0x82, 0x89, 0xC2, 0xE2}) {
-        set(opcode, &CPU::op_nop, AddressingMode::Immediate, 2);
-    }
-
-    for (const uint8_t opcode : {0x04, 0x44, 0x64}) {
-        set(opcode, &CPU::op_nop, AddressingMode::ZeroPage, 3);
-    }
-
-    for (const uint8_t opcode : {0x14, 0x34, 0x54, 0x74, 0xD4, 0xF4}) {
-        set(opcode, &CPU::op_nop, AddressingMode::ZeroPageX, 4);
-    }
-
-    set(0x0C, &CPU::op_nop, AddressingMode::Absolute, 4);
-    for (const uint8_t opcode : {0x1C, 0x3C, 0x5C, 0x7C, 0xDC, 0xFC}) {
-        set(opcode, &CPU::op_nop, AddressingMode::AbsoluteX, 4, true);
-    }
-
-    for (const uint8_t opcode : {0x0B, 0x2B}) {
-        set(opcode, &CPU::op_anc, AddressingMode::Immediate, 2);
-    }
-    set(0x4B, &CPU::op_alr, AddressingMode::Immediate, 2);
-    set(0x6B, &CPU::op_arr, AddressingMode::Immediate, 2);
-    set(0x8B, &CPU::op_ane, AddressingMode::Immediate, 2);
-    set(0xAB, &CPU::op_lxa, AddressingMode::Immediate, 2);
-    set(0xCB, &CPU::op_sbx, AddressingMode::Immediate, 2);
-    set(0xEB, &CPU::op_sbc, AddressingMode::Immediate, 2);
-
-    // SLO (ASL then ORA)
-    set(0x03, &CPU::op_slo, AddressingMode::IndexedIndirect, 8);
-    set(0x07, &CPU::op_slo, AddressingMode::ZeroPage, 5);
-    set(0x0F, &CPU::op_slo, AddressingMode::Absolute, 6);
-    set(0x13, &CPU::op_slo, AddressingMode::IndirectIndexed, 8);
-    set(0x17, &CPU::op_slo, AddressingMode::ZeroPageX, 6);
-    set(0x1B, &CPU::op_slo, AddressingMode::AbsoluteY, 7);
-    set(0x1F, &CPU::op_slo, AddressingMode::AbsoluteX, 7);
-
-    // RLA (ROL then AND)
-    set(0x23, &CPU::op_rla, AddressingMode::IndexedIndirect, 8);
-    set(0x27, &CPU::op_rla, AddressingMode::ZeroPage, 5);
-    set(0x2F, &CPU::op_rla, AddressingMode::Absolute, 6);
-    set(0x33, &CPU::op_rla, AddressingMode::IndirectIndexed, 8);
-    set(0x37, &CPU::op_rla, AddressingMode::ZeroPageX, 6);
-    set(0x3B, &CPU::op_rla, AddressingMode::AbsoluteY, 7);
-    set(0x3F, &CPU::op_rla, AddressingMode::AbsoluteX, 7);
-
-    // SRE (LSR then EOR)
-    set(0x43, &CPU::op_sre, AddressingMode::IndexedIndirect, 8);
-    set(0x47, &CPU::op_sre, AddressingMode::ZeroPage, 5);
-    set(0x4F, &CPU::op_sre, AddressingMode::Absolute, 6);
-    set(0x53, &CPU::op_sre, AddressingMode::IndirectIndexed, 8);
-    set(0x57, &CPU::op_sre, AddressingMode::ZeroPageX, 6);
-    set(0x5B, &CPU::op_sre, AddressingMode::AbsoluteY, 7);
-    set(0x5F, &CPU::op_sre, AddressingMode::AbsoluteX, 7);
-
-    // RRA (ROR then ADC)
-    set(0x63, &CPU::op_rra, AddressingMode::IndexedIndirect, 8);
-    set(0x67, &CPU::op_rra, AddressingMode::ZeroPage, 5);
-    set(0x6F, &CPU::op_rra, AddressingMode::Absolute, 6);
-    set(0x73, &CPU::op_rra, AddressingMode::IndirectIndexed, 8);
-    set(0x77, &CPU::op_rra, AddressingMode::ZeroPageX, 6);
-    set(0x7B, &CPU::op_rra, AddressingMode::AbsoluteY, 7);
-    set(0x7F, &CPU::op_rra, AddressingMode::AbsoluteX, 7);
-
-    // SAX (store A & X)
-    set(0x83, &CPU::op_sax, AddressingMode::IndexedIndirect, 6);
-    set(0x87, &CPU::op_sax, AddressingMode::ZeroPage, 3);
-    set(0x8F, &CPU::op_sax, AddressingMode::Absolute, 4);
-    set(0x97, &CPU::op_sax, AddressingMode::ZeroPageY, 4);
-
-    // SHA / SHS / SHX / SHY variants
-    set(0x93, &CPU::op_sha, AddressingMode::IndirectIndexed, 6);
-    set(0x9B, &CPU::op_shs, AddressingMode::AbsoluteY, 5);
-    set(0x9C, &CPU::op_shy, AddressingMode::AbsoluteX, 5);
-    set(0x9E, &CPU::op_shx, AddressingMode::AbsoluteY, 5);
-    set(0x9F, &CPU::op_sha, AddressingMode::AbsoluteY, 5);
-
-    // LAX (load into A and X)
-    set(0xA3, &CPU::op_lax, AddressingMode::IndexedIndirect, 6);
-    set(0xA7, &CPU::op_lax, AddressingMode::ZeroPage, 3);
-    set(0xAF, &CPU::op_lax, AddressingMode::Absolute, 4);
-    set(0xB3, &CPU::op_lax, AddressingMode::IndirectIndexed, 5, true);
-    set(0xB7, &CPU::op_lax, AddressingMode::ZeroPageY, 4);
-    set(0xBB, &CPU::op_las, AddressingMode::AbsoluteY, 4, true);
-    set(0xBF, &CPU::op_lax, AddressingMode::AbsoluteY, 4, true);
-
-    // DCP (DEC then CMP)
-    set(0xC3, &CPU::op_dcp, AddressingMode::IndexedIndirect, 8);
-    set(0xC7, &CPU::op_dcp, AddressingMode::ZeroPage, 5);
-    set(0xCF, &CPU::op_dcp, AddressingMode::Absolute, 6);
-    set(0xD3, &CPU::op_dcp, AddressingMode::IndirectIndexed, 8);
-    set(0xD7, &CPU::op_dcp, AddressingMode::ZeroPageX, 6);
-    set(0xDB, &CPU::op_dcp, AddressingMode::AbsoluteY, 7);
-    set(0xDF, &CPU::op_dcp, AddressingMode::AbsoluteX, 7);
-
-    // ISC (INC then SBC)
-    set(0xE3, &CPU::op_isc, AddressingMode::IndexedIndirect, 8);
-    set(0xE7, &CPU::op_isc, AddressingMode::ZeroPage, 5);
-    set(0xEF, &CPU::op_isc, AddressingMode::Absolute, 6);
-    set(0xF3, &CPU::op_isc, AddressingMode::IndirectIndexed, 8);
-    set(0xF7, &CPU::op_isc, AddressingMode::ZeroPageX, 6);
-    set(0xFB, &CPU::op_isc, AddressingMode::AbsoluteY, 7);
-    set(0xFF, &CPU::op_isc, AddressingMode::AbsoluteX, 7);
-}
-
-void CPU::execute_instruction(uint8_t opcode) {
-    const InstructionDescriptor& descriptor = dispatch_table_[opcode];
-    if (descriptor.handler == nullptr) {
-        illegal_instruction(opcode);
-        return;
-    }
-
-    active_instruction_ = &descriptor;
-    page_crossed_ = false;
-
-    const auto handler = descriptor.handler;
-    (this->*handler)(descriptor.mode);
-
-    cycles_ += descriptor.cycles;
-    if (descriptor.page_cross_cycle && page_crossed_) {
-        cycles_ += 1;
-    }
-
-    active_instruction_ = nullptr;
-}
-
-void CPU::illegal_instruction(uint8_t opcode) {
-    constexpr char kHexDigits[] = "0123456789ABCDEF";
-    std::string message = "Encountered unimplemented opcode: 0x";
-    message.push_back(kHexDigits[(opcode >> 4) & 0x0F]);
-    message.push_back(kHexDigits[opcode & 0x0F]);
-    throw std::runtime_error(message);
-}
-
-void CPU::op_brk(AddressingMode mode) {
-    static_cast<void>(mode);
-    registers_.program_counter = static_cast<uint16_t>(registers_.program_counter + 1);
-    push16(registers_.program_counter);
-
-    const uint8_t status = static_cast<uint8_t>(registers_.status | kBreakMask | kUnusedMask);
-    push(status);
-
-    set_flag(StatusFlag::InterruptDisable, true);
-
-    const uint8_t low = read(0xFFFE);
-    const uint8_t high = read(0xFFFF);
-    registers_.program_counter = static_cast<uint16_t>((static_cast<uint16_t>(high) << 8) | low);
-}
-
-void CPU::op_nop(AddressingMode mode) {
-    consume_operand(mode);
-}
-
-void CPU::op_lda(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint8_t value = read_operand(mode, page_crossed);
-    registers_.accumulator = value;
+// Almost every instruction that changes A, X or Y also updates Zero and
+// Negative from the new value.
+void CPU::set_register(uint8_t& target, uint8_t value) {
+    target = value;
     update_zero_and_negative(value);
 }
 
-void CPU::op_ldx(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint8_t value = read_operand(mode, page_crossed);
-    registers_.x = value;
-    update_zero_and_negative(registers_.x);
-}
+// ---------------------------------------------------------------------------
+// Arithmetic shared by several instructions
+// ---------------------------------------------------------------------------
 
-void CPU::op_ldy(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint8_t value = read_operand(mode, page_crossed);
-    registers_.y = value;
-    update_zero_and_negative(registers_.y);
-}
+void CPU::add_with_carry(uint8_t operand) {
+    const uint8_t a = registers_.accumulator;
+    const int carry_in = flag(Carry) ? 1 : 0;
+    int sum = a + operand + carry_in;
 
-void CPU::op_sta(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint16_t address = compute_address(mode, page_crossed);
-    page_crossed_ = page_crossed_ || page_crossed;
-    write(address, registers_.accumulator);
-}
+    // Signed overflow: both inputs have the same sign and the result does not.
+    // This is always judged on the plain binary sum, even in decimal mode.
+    set_flag(Overflow, (~(a ^ operand) & (a ^ sum) & 0x80) != 0);
 
-void CPU::op_stx(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint16_t address = compute_address(mode, page_crossed);
-    page_crossed_ = page_crossed_ || page_crossed;
-    write(address, registers_.x);
-}
-
-void CPU::op_sty(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint16_t address = compute_address(mode, page_crossed);
-    page_crossed_ = page_crossed_ || page_crossed;
-    write(address, registers_.y);
-}
-
-void CPU::op_adc(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint8_t operand = read_operand(mode, page_crossed);
-    adc(operand);
-}
-
-void CPU::op_sbc(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint8_t operand = read_operand(mode, page_crossed);
-    sbc(operand);
-}
-
-void CPU::op_and(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint8_t value = read_operand(mode, page_crossed);
-    registers_.accumulator &= value;
-    update_zero_and_negative(registers_.accumulator);
-}
-
-void CPU::op_ora(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint8_t value = read_operand(mode, page_crossed);
-    registers_.accumulator |= value;
-    update_zero_and_negative(registers_.accumulator);
-}
-
-void CPU::op_eor(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint8_t value = read_operand(mode, page_crossed);
-    registers_.accumulator ^= value;
-    update_zero_and_negative(registers_.accumulator);
-}
-
-void CPU::op_cmp(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint8_t value = read_operand(mode, page_crossed);
-    const uint8_t result = static_cast<uint8_t>(registers_.accumulator - value);
-    set_flag(StatusFlag::Carry, registers_.accumulator >= value);
-    update_zero_and_negative(result);
-}
-
-void CPU::op_cpx(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint8_t value = read_operand(mode, page_crossed);
-    const uint8_t result = static_cast<uint8_t>(registers_.x - value);
-    set_flag(StatusFlag::Carry, registers_.x >= value);
-    update_zero_and_negative(result);
-}
-
-void CPU::op_cpy(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint8_t value = read_operand(mode, page_crossed);
-    const uint8_t result = static_cast<uint8_t>(registers_.y - value);
-    set_flag(StatusFlag::Carry, registers_.y >= value);
-    update_zero_and_negative(result);
-}
-
-void CPU::op_bit(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint8_t value = read_operand(mode, page_crossed);
-    const uint8_t masked = static_cast<uint8_t>(registers_.accumulator & value);
-    set_flag(StatusFlag::Zero, masked == 0);
-    set_flag(StatusFlag::Negative, (value & 0x80) != 0);
-    set_flag(StatusFlag::Overflow, (value & 0x40) != 0);
-}
-
-void CPU::op_inc(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint16_t address = compute_address(mode, page_crossed);
-    uint8_t value = read(address);
-    value = static_cast<uint8_t>(value + 1);
-    write(address, value);
-    update_zero_and_negative(value);
-    page_crossed_ = page_crossed_ || page_crossed;
-}
-
-void CPU::op_dec(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint16_t address = compute_address(mode, page_crossed);
-    uint8_t value = read(address);
-    value = static_cast<uint8_t>(value - 1);
-    write(address, value);
-    update_zero_and_negative(value);
-    page_crossed_ = page_crossed_ || page_crossed;
-}
-
-void CPU::op_inx(AddressingMode mode) {
-    static_cast<void>(mode);
-    registers_.x = static_cast<uint8_t>(registers_.x + 1);
-    update_zero_and_negative(registers_.x);
-}
-
-void CPU::op_iny(AddressingMode mode) {
-    static_cast<void>(mode);
-    registers_.y = static_cast<uint8_t>(registers_.y + 1);
-    update_zero_and_negative(registers_.y);
-}
-
-void CPU::op_dex(AddressingMode mode) {
-    static_cast<void>(mode);
-    registers_.x = static_cast<uint8_t>(registers_.x - 1);
-    update_zero_and_negative(registers_.x);
-}
-
-void CPU::op_dey(AddressingMode mode) {
-    static_cast<void>(mode);
-    registers_.y = static_cast<uint8_t>(registers_.y - 1);
-    update_zero_and_negative(registers_.y);
-}
-
-void CPU::op_asl(AddressingMode mode) {
-    bool page_crossed = false;
-    if (mode == AddressingMode::Accumulator) {
-        set_flag(StatusFlag::Carry, (registers_.accumulator & 0x80) != 0);
-        registers_.accumulator = static_cast<uint8_t>(registers_.accumulator << 1);
-        update_zero_and_negative(registers_.accumulator);
+    if (flag(Decimal)) {
+        // Each 4-bit digit holds 0-9. A digit that overflowed past 9 is pushed
+        // on to the next one by adding 6, which skips the unused values A-F.
+        if ((a & 0x0F) + (operand & 0x0F) + carry_in > 0x09) {
+            sum += 0x06;
+        }
+        if (sum > 0x99) {
+            sum += 0x60;
+        }
+        set_flag(Carry, sum > 0x99);
     } else {
-        const uint16_t address = compute_address(mode, page_crossed);
-        uint8_t value = read(address);
-        set_flag(StatusFlag::Carry, (value & 0x80) != 0);
-        value = static_cast<uint8_t>(value << 1);
-        write(address, value);
-        update_zero_and_negative(value);
-        page_crossed_ = page_crossed_ || page_crossed;
+        set_flag(Carry, sum > 0xFF);
+    }
+
+    set_register(registers_.accumulator, static_cast<uint8_t>(sum));
+}
+
+void CPU::subtract_with_carry(uint8_t operand) {
+    const uint8_t a = registers_.accumulator;
+    // For subtraction the carry flag works backwards: clear means "borrow".
+    const int borrow_in = flag(Carry) ? 0 : 1;
+    const int difference = a - operand - borrow_in;
+
+    set_flag(Overflow, ((a ^ difference) & (a ^ operand) & 0x80) != 0);
+
+    if (flag(Decimal)) {
+        // Subtract one decimal digit at a time, borrowing 10 when a digit
+        // goes negative.
+        int low = (a & 0x0F) - (operand & 0x0F) - borrow_in;
+        const int low_borrow = low < 0 ? 1 : 0;
+        if (low < 0) {
+            low += 10;
+        }
+
+        int high = (a >> 4) - (operand >> 4) - low_borrow;
+        set_flag(Carry, high >= 0);
+        if (high < 0) {
+            high += 10;
+        }
+
+        set_register(registers_.accumulator, static_cast<uint8_t>(high << 4 | (low & 0x0F)));
+    } else {
+        set_flag(Carry, difference >= 0);
+        set_register(registers_.accumulator, static_cast<uint8_t>(difference));
     }
 }
 
-void CPU::op_lsr(AddressingMode mode) {
-    bool page_crossed = false;
-    if (mode == AddressingMode::Accumulator) {
-        set_flag(StatusFlag::Carry, (registers_.accumulator & 0x01) != 0);
-        registers_.accumulator = static_cast<uint8_t>(registers_.accumulator >> 1);
-        update_zero_and_negative(registers_.accumulator);
-    } else {
-        const uint16_t address = compute_address(mode, page_crossed);
-        uint8_t value = read(address);
-        set_flag(StatusFlag::Carry, (value & 0x01) != 0);
-        value = static_cast<uint8_t>(value >> 1);
-        write(address, value);
-        update_zero_and_negative(value);
-        page_crossed_ = page_crossed_ || page_crossed;
-    }
+// CMP, CPX and CPY subtract without storing the result; only the flags change.
+void CPU::compare(uint8_t register_value, uint8_t operand) {
+    set_flag(Carry, register_value >= operand);
+    update_zero_and_negative(static_cast<uint8_t>(register_value - operand));
 }
 
-void CPU::op_rol(AddressingMode mode) {
-    bool page_crossed = false;
-    if (mode == AddressingMode::Accumulator) {
-        const bool carry_in = flag(StatusFlag::Carry);
-        set_flag(StatusFlag::Carry, (registers_.accumulator & 0x80) != 0);
-        registers_.accumulator = static_cast<uint8_t>((registers_.accumulator << 1) | (carry_in ? 1 : 0));
-        update_zero_and_negative(registers_.accumulator);
-    } else {
-        const uint16_t address = compute_address(mode, page_crossed);
-        uint8_t value = read(address);
-        const bool carry_in = flag(StatusFlag::Carry);
-        set_flag(StatusFlag::Carry, (value & 0x80) != 0);
-        value = static_cast<uint8_t>((value << 1) | (carry_in ? 1 : 0));
-        write(address, value);
-        update_zero_and_negative(value);
-        page_crossed_ = page_crossed_ || page_crossed;
-    }
-}
-
-void CPU::op_ror(AddressingMode mode) {
-    bool page_crossed = false;
-    if (mode == AddressingMode::Accumulator) {
-        const bool carry_in = flag(StatusFlag::Carry);
-        set_flag(StatusFlag::Carry, (registers_.accumulator & 0x01) != 0);
-        registers_.accumulator = static_cast<uint8_t>((registers_.accumulator >> 1) | (carry_in ? 0x80 : 0x00));
-        update_zero_and_negative(registers_.accumulator);
-    } else {
-        const uint16_t address = compute_address(mode, page_crossed);
-        uint8_t value = read(address);
-        const bool carry_in = flag(StatusFlag::Carry);
-        set_flag(StatusFlag::Carry, (value & 0x01) != 0);
-        value = static_cast<uint8_t>((value >> 1) | (carry_in ? 0x80 : 0x00));
-        write(address, value);
-        update_zero_and_negative(value);
-        page_crossed_ = page_crossed_ || page_crossed;
-    }
-}
-
-void CPU::op_jsr(AddressingMode mode) {
-    static_cast<void>(mode);
-    const uint16_t target = fetch_word();
-    const uint16_t return_address = static_cast<uint16_t>(registers_.program_counter - 1);
-    push16(return_address);
-    registers_.program_counter = target;
-}
-
-void CPU::op_rts(AddressingMode mode) {
-    static_cast<void>(mode);
-    const uint16_t address = pull16();
-    registers_.program_counter = static_cast<uint16_t>(address + 1);
-}
-
-void CPU::op_rti(AddressingMode mode) {
-    static_cast<void>(mode);
-    registers_.status = static_cast<uint8_t>((pull() & ~kBreakMask) | kUnusedMask);
-    registers_.program_counter = pull16();
-}
-
-void CPU::op_jmp(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint16_t target = compute_address(mode, page_crossed);
-    registers_.program_counter = target;
-}
-
-void CPU::op_pha(AddressingMode mode) {
-    static_cast<void>(mode);
-    push(registers_.accumulator);
-}
-
-void CPU::op_php(AddressingMode mode) {
-    static_cast<void>(mode);
-    const uint8_t status = static_cast<uint8_t>(registers_.status | kBreakMask | kUnusedMask);
-    push(status);
-}
-
-void CPU::op_pla(AddressingMode mode) {
-    static_cast<void>(mode);
-    registers_.accumulator = pull();
-    update_zero_and_negative(registers_.accumulator);
-}
-
-void CPU::op_plp(AddressingMode mode) {
-    static_cast<void>(mode);
-    registers_.status = static_cast<uint8_t>((pull() & ~kBreakMask) | kUnusedMask);
-}
-
-void CPU::op_clc(AddressingMode mode) {
-    static_cast<void>(mode);
-    set_flag(StatusFlag::Carry, false);
-}
-
-void CPU::op_sec(AddressingMode mode) {
-    static_cast<void>(mode);
-    set_flag(StatusFlag::Carry, true);
-}
-
-void CPU::op_cli(AddressingMode mode) {
-    static_cast<void>(mode);
-    set_flag(StatusFlag::InterruptDisable, false);
-}
-
-void CPU::op_sei(AddressingMode mode) {
-    static_cast<void>(mode);
-    set_flag(StatusFlag::InterruptDisable, true);
-}
-
-void CPU::op_cld(AddressingMode mode) {
-    static_cast<void>(mode);
-    set_flag(StatusFlag::Decimal, false);
-}
-
-void CPU::op_sed(AddressingMode mode) {
-    static_cast<void>(mode);
-    set_flag(StatusFlag::Decimal, true);
-}
-
-void CPU::op_clv(AddressingMode mode) {
-    static_cast<void>(mode);
-    set_flag(StatusFlag::Overflow, false);
-}
-
-void CPU::op_tax(AddressingMode mode) {
-    static_cast<void>(mode);
-    registers_.x = registers_.accumulator;
-    update_zero_and_negative(registers_.x);
-}
-
-void CPU::op_tay(AddressingMode mode) {
-    static_cast<void>(mode);
-    registers_.y = registers_.accumulator;
-    update_zero_and_negative(registers_.y);
-}
-
-void CPU::op_txa(AddressingMode mode) {
-    static_cast<void>(mode);
-    registers_.accumulator = registers_.x;
-    update_zero_and_negative(registers_.accumulator);
-}
-
-void CPU::op_tya(AddressingMode mode) {
-    static_cast<void>(mode);
-    registers_.accumulator = registers_.y;
-    update_zero_and_negative(registers_.accumulator);
-}
-
-void CPU::op_tsx(AddressingMode mode) {
-    static_cast<void>(mode);
-    registers_.x = registers_.stack_pointer;
-    update_zero_and_negative(registers_.x);
-}
-
-void CPU::op_txs(AddressingMode mode) {
-    static_cast<void>(mode);
-    registers_.stack_pointer = registers_.x;
-}
-
-void CPU::op_branch(AddressingMode mode, bool condition) {
-    bool page_crossed = false;
-    const uint16_t target = compute_address(mode, page_crossed);
+// A branch costs one extra cycle when taken, and another if the target is in
+// a different page.
+void CPU::branch_if(bool condition) {
+    const uint16_t target = operand_address(Relative);
     if (condition) {
-        cycles_ += 1;
-        if (page_crossed) {
-            cycles_ += 1;
-        }
+        cycles_ += page_crossed_ ? 2 : 1;
         registers_.program_counter = target;
     }
 }
 
-void CPU::op_bpl(AddressingMode mode) {
-    op_branch(mode, !flag(StatusFlag::Negative));
-}
-
-void CPU::op_bmi(AddressingMode mode) {
-    op_branch(mode, flag(StatusFlag::Negative));
-}
-
-void CPU::op_bvc(AddressingMode mode) {
-    op_branch(mode, !flag(StatusFlag::Overflow));
-}
-
-void CPU::op_bvs(AddressingMode mode) {
-    op_branch(mode, flag(StatusFlag::Overflow));
-}
-
-void CPU::op_bcc(AddressingMode mode) {
-    op_branch(mode, !flag(StatusFlag::Carry));
-}
-
-void CPU::op_bcs(AddressingMode mode) {
-    op_branch(mode, flag(StatusFlag::Carry));
-}
-
-void CPU::op_bne(AddressingMode mode) {
-    op_branch(mode, !flag(StatusFlag::Zero));
-}
-
-void CPU::op_beq(AddressingMode mode) {
-    op_branch(mode, flag(StatusFlag::Zero));
-}
-
-void CPU::op_lax(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint8_t value = read_operand(mode, page_crossed);
-    registers_.accumulator = value;
-    registers_.x = value;
-    update_zero_and_negative(value);
-}
-
-void CPU::op_sax(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint16_t address = compute_address(mode, page_crossed);
-    write(address, static_cast<uint8_t>(registers_.accumulator & registers_.x));
-    page_crossed_ = page_crossed_ || page_crossed;
-}
-
-void CPU::op_dcp(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint16_t address = compute_address(mode, page_crossed);
-    uint8_t value = read(address);
-    value = static_cast<uint8_t>(value - 1);
-    write(address, value);
-
-    set_flag(StatusFlag::Carry, registers_.accumulator >= value);
-    const uint8_t result = static_cast<uint8_t>(registers_.accumulator - value);
-    update_zero_and_negative(result);
-    page_crossed_ = page_crossed_ || page_crossed;
-}
-
-void CPU::op_isc(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint16_t address = compute_address(mode, page_crossed);
-    uint8_t value = static_cast<uint8_t>(read(address) + 1);
-    write(address, value);
-    sbc(value);
-    page_crossed_ = page_crossed_ || page_crossed;
-}
-
-void CPU::op_slo(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint16_t address = compute_address(mode, page_crossed);
-    uint8_t value = read(address);
-    set_flag(StatusFlag::Carry, (value & 0x80) != 0);
+// The shifts and rotates move the bit that falls off the end into Carry.
+// Rotates also bring the old Carry in at the other end.
+uint8_t CPU::shift_left(uint8_t value) {
+    set_flag(Carry, (value & 0x80) != 0);
     value = static_cast<uint8_t>(value << 1);
-    write(address, value);
-    registers_.accumulator |= value;
-    update_zero_and_negative(registers_.accumulator);
-    page_crossed_ = page_crossed_ || page_crossed;
-}
-
-void CPU::op_rla(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint16_t address = compute_address(mode, page_crossed);
-    uint8_t value = read(address);
-    const bool carry_in = flag(StatusFlag::Carry);
-    set_flag(StatusFlag::Carry, (value & 0x80) != 0);
-    value = static_cast<uint8_t>((value << 1) | (carry_in ? 1 : 0));
-    write(address, value);
-    registers_.accumulator &= value;
-    update_zero_and_negative(registers_.accumulator);
-    page_crossed_ = page_crossed_ || page_crossed;
-}
-
-void CPU::op_sre(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint16_t address = compute_address(mode, page_crossed);
-    uint8_t value = read(address);
-    set_flag(StatusFlag::Carry, (value & 0x01) != 0);
-    value = static_cast<uint8_t>(value >> 1);
-    write(address, value);
-    registers_.accumulator ^= value;
-    update_zero_and_negative(registers_.accumulator);
-    page_crossed_ = page_crossed_ || page_crossed;
-}
-
-void CPU::op_rra(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint16_t address = compute_address(mode, page_crossed);
-    uint8_t value = read(address);
-    const bool carry_in = flag(StatusFlag::Carry);
-    set_flag(StatusFlag::Carry, (value & 0x01) != 0);
-    value = static_cast<uint8_t>((value >> 1) | (carry_in ? 0x80 : 0x00));
-    write(address, value);
-    adc(value);
-    page_crossed_ = page_crossed_ || page_crossed;
-}
-
-void CPU::op_anc(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint8_t operand = read_operand(mode, page_crossed);
-    registers_.accumulator = static_cast<uint8_t>(registers_.accumulator & operand);
-    update_zero_and_negative(registers_.accumulator);
-    set_flag(StatusFlag::Carry, (registers_.accumulator & 0x80) != 0);
-}
-
-void CPU::op_alr(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint8_t operand = read_operand(mode, page_crossed);
-    uint8_t value = static_cast<uint8_t>(registers_.accumulator & operand);
-    set_flag(StatusFlag::Carry, (value & 0x01) != 0);
-    value = static_cast<uint8_t>(value >> 1);
-    registers_.accumulator = value;
-    update_zero_and_negative(registers_.accumulator);
-}
-
-void CPU::op_arr(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint8_t operand = read_operand(mode, page_crossed);
-    const uint8_t masked = static_cast<uint8_t>(registers_.accumulator & operand);
-    const bool carry_in = flag(StatusFlag::Carry);
-    const uint8_t result = static_cast<uint8_t>((masked >> 1) | (carry_in ? 0x80 : 0x00));
-
-    registers_.accumulator = result;
-    const bool bit6 = (result & 0x40) != 0;
-    const bool bit5 = (result & 0x20) != 0;
-    set_flag(StatusFlag::Carry, bit6);
-    set_flag(StatusFlag::Overflow, bit6 ^ bit5);
-    update_zero_and_negative(result);
-}
-
-void CPU::op_ane(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint8_t operand = read_operand(mode, page_crossed);
-    const uint8_t value = static_cast<uint8_t>((registers_.accumulator | 0xEE) & registers_.x & operand);
-    registers_.accumulator = value;
     update_zero_and_negative(value);
+    return value;
+}
+
+uint8_t CPU::shift_right(uint8_t value) {
+    set_flag(Carry, (value & 0x01) != 0);
+    value = static_cast<uint8_t>(value >> 1);
+    update_zero_and_negative(value);
+    return value;
+}
+
+uint8_t CPU::rotate_left(uint8_t value) {
+    const uint8_t carry_in = flag(Carry) ? 0x01 : 0x00;
+    set_flag(Carry, (value & 0x80) != 0);
+    value = static_cast<uint8_t>(value << 1 | carry_in);
+    update_zero_and_negative(value);
+    return value;
+}
+
+uint8_t CPU::rotate_right(uint8_t value) {
+    const uint8_t carry_in = flag(Carry) ? 0x80 : 0x00;
+    set_flag(Carry, (value & 0x01) != 0);
+    value = static_cast<uint8_t>(value >> 1 | carry_in);
+    update_zero_and_negative(value);
+    return value;
+}
+
+uint8_t CPU::increment(uint8_t value) {
+    value++;
+    update_zero_and_negative(value);
+    return value;
+}
+
+uint8_t CPU::decrement(uint8_t value) {
+    value--;
+    update_zero_and_negative(value);
+    return value;
+}
+
+// ---------------------------------------------------------------------------
+// Opcode table
+// ---------------------------------------------------------------------------
+
+void CPU::build_instruction_table() {
+    // Passed as the last argument for instructions that take one extra cycle
+    // when indexing crosses a page boundary.
+    constexpr bool kPageCrossPenalty = true;
+
+    const auto set = [this](uint8_t opcode, const char* mnemonic, Handler handler, AddressingMode mode,
+                            uint8_t cycles, bool page_cross_penalty = false) {
+        instructions_[opcode] = Instruction{mnemonic, handler, mode, cycles, page_cross_penalty};
+    };
+
+    // --- Load/Store ---
+    set(0xA9, "LDA", &CPU::op_lda, Immediate, 2);
+    set(0xA5, "LDA", &CPU::op_lda, ZeroPage, 3);
+    set(0xB5, "LDA", &CPU::op_lda, ZeroPageX, 4);
+    set(0xAD, "LDA", &CPU::op_lda, Absolute, 4);
+    set(0xBD, "LDA", &CPU::op_lda, AbsoluteX, 4, kPageCrossPenalty);
+    set(0xB9, "LDA", &CPU::op_lda, AbsoluteY, 4, kPageCrossPenalty);
+    set(0xA1, "LDA", &CPU::op_lda, IndexedIndirect, 6);
+    set(0xB1, "LDA", &CPU::op_lda, IndirectIndexed, 5, kPageCrossPenalty);
+
+    set(0xA2, "LDX", &CPU::op_ldx, Immediate, 2);
+    set(0xA6, "LDX", &CPU::op_ldx, ZeroPage, 3);
+    set(0xB6, "LDX", &CPU::op_ldx, ZeroPageY, 4);
+    set(0xAE, "LDX", &CPU::op_ldx, Absolute, 4);
+    set(0xBE, "LDX", &CPU::op_ldx, AbsoluteY, 4, kPageCrossPenalty);
+
+    set(0xA0, "LDY", &CPU::op_ldy, Immediate, 2);
+    set(0xA4, "LDY", &CPU::op_ldy, ZeroPage, 3);
+    set(0xB4, "LDY", &CPU::op_ldy, ZeroPageX, 4);
+    set(0xAC, "LDY", &CPU::op_ldy, Absolute, 4);
+    set(0xBC, "LDY", &CPU::op_ldy, AbsoluteX, 4, kPageCrossPenalty);
+
+    set(0x85, "STA", &CPU::op_sta, ZeroPage, 3);
+    set(0x95, "STA", &CPU::op_sta, ZeroPageX, 4);
+    set(0x8D, "STA", &CPU::op_sta, Absolute, 4);
+    set(0x9D, "STA", &CPU::op_sta, AbsoluteX, 5);
+    set(0x99, "STA", &CPU::op_sta, AbsoluteY, 5);
+    set(0x81, "STA", &CPU::op_sta, IndexedIndirect, 6);
+    set(0x91, "STA", &CPU::op_sta, IndirectIndexed, 6);
+
+    set(0x86, "STX", &CPU::op_stx, ZeroPage, 3);
+    set(0x96, "STX", &CPU::op_stx, ZeroPageY, 4);
+    set(0x8E, "STX", &CPU::op_stx, Absolute, 4);
+
+    set(0x84, "STY", &CPU::op_sty, ZeroPage, 3);
+    set(0x94, "STY", &CPU::op_sty, ZeroPageX, 4);
+    set(0x8C, "STY", &CPU::op_sty, Absolute, 4);
+
+    // --- Arithmetic / Logic ---
+    set(0x69, "ADC", &CPU::op_adc, Immediate, 2);
+    set(0x65, "ADC", &CPU::op_adc, ZeroPage, 3);
+    set(0x75, "ADC", &CPU::op_adc, ZeroPageX, 4);
+    set(0x6D, "ADC", &CPU::op_adc, Absolute, 4);
+    set(0x7D, "ADC", &CPU::op_adc, AbsoluteX, 4, kPageCrossPenalty);
+    set(0x79, "ADC", &CPU::op_adc, AbsoluteY, 4, kPageCrossPenalty);
+    set(0x61, "ADC", &CPU::op_adc, IndexedIndirect, 6);
+    set(0x71, "ADC", &CPU::op_adc, IndirectIndexed, 5, kPageCrossPenalty);
+
+    set(0xE9, "SBC", &CPU::op_sbc, Immediate, 2);
+    set(0xE5, "SBC", &CPU::op_sbc, ZeroPage, 3);
+    set(0xF5, "SBC", &CPU::op_sbc, ZeroPageX, 4);
+    set(0xED, "SBC", &CPU::op_sbc, Absolute, 4);
+    set(0xFD, "SBC", &CPU::op_sbc, AbsoluteX, 4, kPageCrossPenalty);
+    set(0xF9, "SBC", &CPU::op_sbc, AbsoluteY, 4, kPageCrossPenalty);
+    set(0xE1, "SBC", &CPU::op_sbc, IndexedIndirect, 6);
+    set(0xF1, "SBC", &CPU::op_sbc, IndirectIndexed, 5, kPageCrossPenalty);
+
+    set(0x29, "AND", &CPU::op_and, Immediate, 2);
+    set(0x25, "AND", &CPU::op_and, ZeroPage, 3);
+    set(0x35, "AND", &CPU::op_and, ZeroPageX, 4);
+    set(0x2D, "AND", &CPU::op_and, Absolute, 4);
+    set(0x3D, "AND", &CPU::op_and, AbsoluteX, 4, kPageCrossPenalty);
+    set(0x39, "AND", &CPU::op_and, AbsoluteY, 4, kPageCrossPenalty);
+    set(0x21, "AND", &CPU::op_and, IndexedIndirect, 6);
+    set(0x31, "AND", &CPU::op_and, IndirectIndexed, 5, kPageCrossPenalty);
+
+    set(0x09, "ORA", &CPU::op_ora, Immediate, 2);
+    set(0x05, "ORA", &CPU::op_ora, ZeroPage, 3);
+    set(0x15, "ORA", &CPU::op_ora, ZeroPageX, 4);
+    set(0x0D, "ORA", &CPU::op_ora, Absolute, 4);
+    set(0x1D, "ORA", &CPU::op_ora, AbsoluteX, 4, kPageCrossPenalty);
+    set(0x19, "ORA", &CPU::op_ora, AbsoluteY, 4, kPageCrossPenalty);
+    set(0x01, "ORA", &CPU::op_ora, IndexedIndirect, 6);
+    set(0x11, "ORA", &CPU::op_ora, IndirectIndexed, 5, kPageCrossPenalty);
+
+    set(0x49, "EOR", &CPU::op_eor, Immediate, 2);
+    set(0x45, "EOR", &CPU::op_eor, ZeroPage, 3);
+    set(0x55, "EOR", &CPU::op_eor, ZeroPageX, 4);
+    set(0x4D, "EOR", &CPU::op_eor, Absolute, 4);
+    set(0x5D, "EOR", &CPU::op_eor, AbsoluteX, 4, kPageCrossPenalty);
+    set(0x59, "EOR", &CPU::op_eor, AbsoluteY, 4, kPageCrossPenalty);
+    set(0x41, "EOR", &CPU::op_eor, IndexedIndirect, 6);
+    set(0x51, "EOR", &CPU::op_eor, IndirectIndexed, 5, kPageCrossPenalty);
+
+    set(0xC9, "CMP", &CPU::op_cmp, Immediate, 2);
+    set(0xC5, "CMP", &CPU::op_cmp, ZeroPage, 3);
+    set(0xD5, "CMP", &CPU::op_cmp, ZeroPageX, 4);
+    set(0xCD, "CMP", &CPU::op_cmp, Absolute, 4);
+    set(0xDD, "CMP", &CPU::op_cmp, AbsoluteX, 4, kPageCrossPenalty);
+    set(0xD9, "CMP", &CPU::op_cmp, AbsoluteY, 4, kPageCrossPenalty);
+    set(0xC1, "CMP", &CPU::op_cmp, IndexedIndirect, 6);
+    set(0xD1, "CMP", &CPU::op_cmp, IndirectIndexed, 5, kPageCrossPenalty);
+
+    set(0xE0, "CPX", &CPU::op_cpx, Immediate, 2);
+    set(0xE4, "CPX", &CPU::op_cpx, ZeroPage, 3);
+    set(0xEC, "CPX", &CPU::op_cpx, Absolute, 4);
+
+    set(0xC0, "CPY", &CPU::op_cpy, Immediate, 2);
+    set(0xC4, "CPY", &CPU::op_cpy, ZeroPage, 3);
+    set(0xCC, "CPY", &CPU::op_cpy, Absolute, 4);
+
+    set(0x24, "BIT", &CPU::op_bit, ZeroPage, 3);
+    set(0x2C, "BIT", &CPU::op_bit, Absolute, 4);
+
+    // --- Increment / Decrement ---
+    set(0xE6, "INC", &CPU::op_inc, ZeroPage, 5);
+    set(0xF6, "INC", &CPU::op_inc, ZeroPageX, 6);
+    set(0xEE, "INC", &CPU::op_inc, Absolute, 6);
+    set(0xFE, "INC", &CPU::op_inc, AbsoluteX, 7);
+
+    set(0xC6, "DEC", &CPU::op_dec, ZeroPage, 5);
+    set(0xD6, "DEC", &CPU::op_dec, ZeroPageX, 6);
+    set(0xCE, "DEC", &CPU::op_dec, Absolute, 6);
+    set(0xDE, "DEC", &CPU::op_dec, AbsoluteX, 7);
+
+    set(0xE8, "INX", &CPU::op_inx, Implied, 2);
+    set(0xC8, "INY", &CPU::op_iny, Implied, 2);
+    set(0xCA, "DEX", &CPU::op_dex, Implied, 2);
+    set(0x88, "DEY", &CPU::op_dey, Implied, 2);
+
+    // --- Shift / Rotate ---
+    set(0x0A, "ASL", &CPU::op_asl, Accumulator, 2);
+    set(0x06, "ASL", &CPU::op_asl, ZeroPage, 5);
+    set(0x16, "ASL", &CPU::op_asl, ZeroPageX, 6);
+    set(0x0E, "ASL", &CPU::op_asl, Absolute, 6);
+    set(0x1E, "ASL", &CPU::op_asl, AbsoluteX, 7);
+
+    set(0x4A, "LSR", &CPU::op_lsr, Accumulator, 2);
+    set(0x46, "LSR", &CPU::op_lsr, ZeroPage, 5);
+    set(0x56, "LSR", &CPU::op_lsr, ZeroPageX, 6);
+    set(0x4E, "LSR", &CPU::op_lsr, Absolute, 6);
+    set(0x5E, "LSR", &CPU::op_lsr, AbsoluteX, 7);
+
+    set(0x2A, "ROL", &CPU::op_rol, Accumulator, 2);
+    set(0x26, "ROL", &CPU::op_rol, ZeroPage, 5);
+    set(0x36, "ROL", &CPU::op_rol, ZeroPageX, 6);
+    set(0x2E, "ROL", &CPU::op_rol, Absolute, 6);
+    set(0x3E, "ROL", &CPU::op_rol, AbsoluteX, 7);
+
+    set(0x6A, "ROR", &CPU::op_ror, Accumulator, 2);
+    set(0x66, "ROR", &CPU::op_ror, ZeroPage, 5);
+    set(0x76, "ROR", &CPU::op_ror, ZeroPageX, 6);
+    set(0x6E, "ROR", &CPU::op_ror, Absolute, 6);
+    set(0x7E, "ROR", &CPU::op_ror, AbsoluteX, 7);
+
+    // --- Branches ---
+    set(0x10, "BPL", &CPU::op_bpl, Relative, 2);
+    set(0x30, "BMI", &CPU::op_bmi, Relative, 2);
+    set(0x50, "BVC", &CPU::op_bvc, Relative, 2);
+    set(0x70, "BVS", &CPU::op_bvs, Relative, 2);
+    set(0x90, "BCC", &CPU::op_bcc, Relative, 2);
+    set(0xB0, "BCS", &CPU::op_bcs, Relative, 2);
+    set(0xD0, "BNE", &CPU::op_bne, Relative, 2);
+    set(0xF0, "BEQ", &CPU::op_beq, Relative, 2);
+
+    // --- Transfer / Stack ---
+    set(0xAA, "TAX", &CPU::op_tax, Implied, 2);
+    set(0xA8, "TAY", &CPU::op_tay, Implied, 2);
+    set(0x8A, "TXA", &CPU::op_txa, Implied, 2);
+    set(0x98, "TYA", &CPU::op_tya, Implied, 2);
+    set(0xBA, "TSX", &CPU::op_tsx, Implied, 2);
+    set(0x9A, "TXS", &CPU::op_txs, Implied, 2);
+
+    set(0x48, "PHA", &CPU::op_pha, Implied, 3);
+    set(0x08, "PHP", &CPU::op_php, Implied, 3);
+    set(0x68, "PLA", &CPU::op_pla, Implied, 4);
+    set(0x28, "PLP", &CPU::op_plp, Implied, 4);
+
+    // --- Status ---
+    set(0x18, "CLC", &CPU::op_clc, Implied, 2);
+    set(0x38, "SEC", &CPU::op_sec, Implied, 2);
+    set(0x58, "CLI", &CPU::op_cli, Implied, 2);
+    set(0x78, "SEI", &CPU::op_sei, Implied, 2);
+    set(0xB8, "CLV", &CPU::op_clv, Implied, 2);
+    set(0xD8, "CLD", &CPU::op_cld, Implied, 2);
+    set(0xF8, "SED", &CPU::op_sed, Implied, 2);
+
+    // --- Control ---
+    set(0x00, "BRK", &CPU::op_brk, Implied, 7);
+    set(0xEA, "NOP", &CPU::op_nop, Implied, 2);
+    set(0x4C, "JMP", &CPU::op_jmp, Absolute, 3);
+    set(0x6C, "JMP", &CPU::op_jmp, Indirect, 5);
+    set(0x20, "JSR", &CPU::op_jsr, Absolute, 6);
+    set(0x40, "RTI", &CPU::op_rti, Implied, 6);
+    set(0x60, "RTS", &CPU::op_rts, Implied, 6);
+
+    // --- Undocumented operations ---
+    for (const uint8_t opcode : {0x02, 0x12, 0x22, 0x32, 0x42, 0x52, 0x62, 0x72, 0x92, 0xB2, 0xD2, 0xF2}) {
+        set(opcode, "JAM", &CPU::op_jam, Implied, 0);
+    }
+
+    for (const uint8_t opcode : {0x1A, 0x3A, 0x5A, 0x7A, 0xDA, 0xFA}) {
+        set(opcode, "NOP", &CPU::op_nop, Implied, 2);
+    }
+
+    for (const uint8_t opcode : {0x80, 0x82, 0x89, 0xC2, 0xE2}) {
+        set(opcode, "NOP", &CPU::op_nop, Immediate, 2);
+    }
+
+    for (const uint8_t opcode : {0x04, 0x44, 0x64}) {
+        set(opcode, "NOP", &CPU::op_nop, ZeroPage, 3);
+    }
+
+    for (const uint8_t opcode : {0x14, 0x34, 0x54, 0x74, 0xD4, 0xF4}) {
+        set(opcode, "NOP", &CPU::op_nop, ZeroPageX, 4);
+    }
+
+    set(0x0C, "NOP", &CPU::op_nop, Absolute, 4);
+    for (const uint8_t opcode : {0x1C, 0x3C, 0x5C, 0x7C, 0xDC, 0xFC}) {
+        set(opcode, "NOP", &CPU::op_nop, AbsoluteX, 4, kPageCrossPenalty);
+    }
+
+    for (const uint8_t opcode : {0x0B, 0x2B}) {
+        set(opcode, "ANC", &CPU::op_anc, Immediate, 2);
+    }
+    set(0x4B, "ALR", &CPU::op_alr, Immediate, 2);
+    set(0x6B, "ARR", &CPU::op_arr, Immediate, 2);
+    set(0x8B, "ANE", &CPU::op_ane, Immediate, 2);
+    set(0xAB, "LXA", &CPU::op_lxa, Immediate, 2);
+    set(0xCB, "SBX", &CPU::op_sbx, Immediate, 2);
+    set(0xEB, "SBC", &CPU::op_sbc, Immediate, 2);
+
+    // SLO (ASL then ORA)
+    set(0x03, "SLO", &CPU::op_slo, IndexedIndirect, 8);
+    set(0x07, "SLO", &CPU::op_slo, ZeroPage, 5);
+    set(0x0F, "SLO", &CPU::op_slo, Absolute, 6);
+    set(0x13, "SLO", &CPU::op_slo, IndirectIndexed, 8);
+    set(0x17, "SLO", &CPU::op_slo, ZeroPageX, 6);
+    set(0x1B, "SLO", &CPU::op_slo, AbsoluteY, 7);
+    set(0x1F, "SLO", &CPU::op_slo, AbsoluteX, 7);
+
+    // RLA (ROL then AND)
+    set(0x23, "RLA", &CPU::op_rla, IndexedIndirect, 8);
+    set(0x27, "RLA", &CPU::op_rla, ZeroPage, 5);
+    set(0x2F, "RLA", &CPU::op_rla, Absolute, 6);
+    set(0x33, "RLA", &CPU::op_rla, IndirectIndexed, 8);
+    set(0x37, "RLA", &CPU::op_rla, ZeroPageX, 6);
+    set(0x3B, "RLA", &CPU::op_rla, AbsoluteY, 7);
+    set(0x3F, "RLA", &CPU::op_rla, AbsoluteX, 7);
+
+    // SRE (LSR then EOR)
+    set(0x43, "SRE", &CPU::op_sre, IndexedIndirect, 8);
+    set(0x47, "SRE", &CPU::op_sre, ZeroPage, 5);
+    set(0x4F, "SRE", &CPU::op_sre, Absolute, 6);
+    set(0x53, "SRE", &CPU::op_sre, IndirectIndexed, 8);
+    set(0x57, "SRE", &CPU::op_sre, ZeroPageX, 6);
+    set(0x5B, "SRE", &CPU::op_sre, AbsoluteY, 7);
+    set(0x5F, "SRE", &CPU::op_sre, AbsoluteX, 7);
+
+    // RRA (ROR then ADC)
+    set(0x63, "RRA", &CPU::op_rra, IndexedIndirect, 8);
+    set(0x67, "RRA", &CPU::op_rra, ZeroPage, 5);
+    set(0x6F, "RRA", &CPU::op_rra, Absolute, 6);
+    set(0x73, "RRA", &CPU::op_rra, IndirectIndexed, 8);
+    set(0x77, "RRA", &CPU::op_rra, ZeroPageX, 6);
+    set(0x7B, "RRA", &CPU::op_rra, AbsoluteY, 7);
+    set(0x7F, "RRA", &CPU::op_rra, AbsoluteX, 7);
+
+    // SAX (store A & X)
+    set(0x83, "SAX", &CPU::op_sax, IndexedIndirect, 6);
+    set(0x87, "SAX", &CPU::op_sax, ZeroPage, 3);
+    set(0x8F, "SAX", &CPU::op_sax, Absolute, 4);
+    set(0x97, "SAX", &CPU::op_sax, ZeroPageY, 4);
+
+    // SHA / SHS / SHX / SHY variants
+    set(0x93, "SHA", &CPU::op_sha, IndirectIndexed, 6);
+    set(0x9B, "SHS", &CPU::op_shs, AbsoluteY, 5);
+    set(0x9C, "SHY", &CPU::op_shy, AbsoluteX, 5);
+    set(0x9E, "SHX", &CPU::op_shx, AbsoluteY, 5);
+    set(0x9F, "SHA", &CPU::op_sha, AbsoluteY, 5);
+
+    // LAX (load into A and X)
+    set(0xA3, "LAX", &CPU::op_lax, IndexedIndirect, 6);
+    set(0xA7, "LAX", &CPU::op_lax, ZeroPage, 3);
+    set(0xAF, "LAX", &CPU::op_lax, Absolute, 4);
+    set(0xB3, "LAX", &CPU::op_lax, IndirectIndexed, 5, kPageCrossPenalty);
+    set(0xB7, "LAX", &CPU::op_lax, ZeroPageY, 4);
+    set(0xBB, "LAS", &CPU::op_las, AbsoluteY, 4, kPageCrossPenalty);
+    set(0xBF, "LAX", &CPU::op_lax, AbsoluteY, 4, kPageCrossPenalty);
+
+    // DCP (DEC then CMP)
+    set(0xC3, "DCP", &CPU::op_dcp, IndexedIndirect, 8);
+    set(0xC7, "DCP", &CPU::op_dcp, ZeroPage, 5);
+    set(0xCF, "DCP", &CPU::op_dcp, Absolute, 6);
+    set(0xD3, "DCP", &CPU::op_dcp, IndirectIndexed, 8);
+    set(0xD7, "DCP", &CPU::op_dcp, ZeroPageX, 6);
+    set(0xDB, "DCP", &CPU::op_dcp, AbsoluteY, 7);
+    set(0xDF, "DCP", &CPU::op_dcp, AbsoluteX, 7);
+
+    // ISC (INC then SBC)
+    set(0xE3, "ISC", &CPU::op_isc, IndexedIndirect, 8);
+    set(0xE7, "ISC", &CPU::op_isc, ZeroPage, 5);
+    set(0xEF, "ISC", &CPU::op_isc, Absolute, 6);
+    set(0xF3, "ISC", &CPU::op_isc, IndirectIndexed, 8);
+    set(0xF7, "ISC", &CPU::op_isc, ZeroPageX, 6);
+    set(0xFB, "ISC", &CPU::op_isc, AbsoluteY, 7);
+    set(0xFF, "ISC", &CPU::op_isc, AbsoluteX, 7);
+}
+
+// ---------------------------------------------------------------------------
+// Documented instructions
+//
+// Every handler takes the addressing mode from its table entry. Handlers for
+// instructions with no operand leave the parameter unnamed.
+// ---------------------------------------------------------------------------
+
+// --- Load and store ---
+
+void CPU::op_lda(AddressingMode mode) {
+    set_register(registers_.accumulator, read_operand(mode));
+}
+
+void CPU::op_ldx(AddressingMode mode) {
+    set_register(registers_.x, read_operand(mode));
+}
+
+void CPU::op_ldy(AddressingMode mode) {
+    set_register(registers_.y, read_operand(mode));
+}
+
+void CPU::op_sta(AddressingMode mode) {
+    write(operand_address(mode), registers_.accumulator);
+}
+
+void CPU::op_stx(AddressingMode mode) {
+    write(operand_address(mode), registers_.x);
+}
+
+void CPU::op_sty(AddressingMode mode) {
+    write(operand_address(mode), registers_.y);
+}
+
+// --- Register transfers ---
+
+void CPU::op_tax(AddressingMode) {
+    set_register(registers_.x, registers_.accumulator);
+}
+
+void CPU::op_tay(AddressingMode) {
+    set_register(registers_.y, registers_.accumulator);
+}
+
+void CPU::op_txa(AddressingMode) {
+    set_register(registers_.accumulator, registers_.x);
+}
+
+void CPU::op_tya(AddressingMode) {
+    set_register(registers_.accumulator, registers_.y);
+}
+
+void CPU::op_tsx(AddressingMode) {
+    set_register(registers_.x, registers_.stack_pointer);
+}
+
+// TXS is the one transfer that leaves the flags alone.
+void CPU::op_txs(AddressingMode) {
+    registers_.stack_pointer = registers_.x;
+}
+
+// --- Stack ---
+
+void CPU::op_pha(AddressingMode) {
+    push(registers_.accumulator);
+}
+
+void CPU::op_php(AddressingMode) {
+    push_status();
+}
+
+void CPU::op_pla(AddressingMode) {
+    set_register(registers_.accumulator, pull());
+}
+
+void CPU::op_plp(AddressingMode) {
+    pull_status();
+}
+
+// --- Arithmetic and logic ---
+
+void CPU::op_adc(AddressingMode mode) {
+    add_with_carry(read_operand(mode));
+}
+
+void CPU::op_sbc(AddressingMode mode) {
+    subtract_with_carry(read_operand(mode));
+}
+
+void CPU::op_and(AddressingMode mode) {
+    set_register(registers_.accumulator, registers_.accumulator & read_operand(mode));
+}
+
+void CPU::op_ora(AddressingMode mode) {
+    set_register(registers_.accumulator, registers_.accumulator | read_operand(mode));
+}
+
+void CPU::op_eor(AddressingMode mode) {
+    set_register(registers_.accumulator, registers_.accumulator ^ read_operand(mode));
+}
+
+// BIT tests memory against A without changing either. Zero reflects A AND
+// memory; Negative and Overflow are copied straight from bits 7 and 6 of the
+// memory value.
+void CPU::op_bit(AddressingMode mode) {
+    const uint8_t value = read_operand(mode);
+    set_flag(Zero, (registers_.accumulator & value) == 0);
+    set_flag(Negative, (value & 0x80) != 0);
+    set_flag(Overflow, (value & 0x40) != 0);
+}
+
+void CPU::op_cmp(AddressingMode mode) {
+    compare(registers_.accumulator, read_operand(mode));
+}
+
+void CPU::op_cpx(AddressingMode mode) {
+    compare(registers_.x, read_operand(mode));
+}
+
+void CPU::op_cpy(AddressingMode mode) {
+    compare(registers_.y, read_operand(mode));
+}
+
+// --- Increment and decrement ---
+
+void CPU::op_inc(AddressingMode mode) {
+    modify_operand(mode, &CPU::increment);
+}
+
+void CPU::op_dec(AddressingMode mode) {
+    modify_operand(mode, &CPU::decrement);
+}
+
+void CPU::op_inx(AddressingMode) {
+    registers_.x = increment(registers_.x);
+}
+
+void CPU::op_iny(AddressingMode) {
+    registers_.y = increment(registers_.y);
+}
+
+void CPU::op_dex(AddressingMode) {
+    registers_.x = decrement(registers_.x);
+}
+
+void CPU::op_dey(AddressingMode) {
+    registers_.y = decrement(registers_.y);
+}
+
+// --- Shifts and rotates ---
+
+void CPU::op_asl(AddressingMode mode) {
+    modify_operand(mode, &CPU::shift_left);
+}
+
+void CPU::op_lsr(AddressingMode mode) {
+    modify_operand(mode, &CPU::shift_right);
+}
+
+void CPU::op_rol(AddressingMode mode) {
+    modify_operand(mode, &CPU::rotate_left);
+}
+
+void CPU::op_ror(AddressingMode mode) {
+    modify_operand(mode, &CPU::rotate_right);
+}
+
+// --- Branches ---
+
+void CPU::op_bpl(AddressingMode) {
+    branch_if(!flag(Negative));
+}
+
+void CPU::op_bmi(AddressingMode) {
+    branch_if(flag(Negative));
+}
+
+void CPU::op_bvc(AddressingMode) {
+    branch_if(!flag(Overflow));
+}
+
+void CPU::op_bvs(AddressingMode) {
+    branch_if(flag(Overflow));
+}
+
+void CPU::op_bcc(AddressingMode) {
+    branch_if(!flag(Carry));
+}
+
+void CPU::op_bcs(AddressingMode) {
+    branch_if(flag(Carry));
+}
+
+void CPU::op_bne(AddressingMode) {
+    branch_if(!flag(Zero));
+}
+
+void CPU::op_beq(AddressingMode) {
+    branch_if(flag(Zero));
+}
+
+// --- Jumps, subroutines and interrupts ---
+
+void CPU::op_jmp(AddressingMode mode) {
+    registers_.program_counter = operand_address(mode);
+}
+
+// JSR pushes the address of its own last byte, not of the next instruction.
+// RTS adds the missing one back.
+void CPU::op_jsr(AddressingMode) {
+    const uint16_t target = fetch_word();
+    push_word(registers_.program_counter - 1);
+    registers_.program_counter = target;
+}
+
+void CPU::op_rts(AddressingMode) {
+    registers_.program_counter = pull_word() + 1;
+}
+
+// BRK is a software interrupt. It skips the byte after the opcode, saves the
+// return address and status, disables further interrupts, and jumps through
+// the vector at $FFFE.
+void CPU::op_brk(AddressingMode) {
+    registers_.program_counter++;
+    push_word(registers_.program_counter);
+    push_status();
+    set_flag(InterruptDisable, true);
+    registers_.program_counter = read_word(kInterruptVector);
+}
+
+void CPU::op_rti(AddressingMode) {
+    pull_status();
+    registers_.program_counter = pull_word();
+}
+
+// The undocumented NOPs take an operand, which still has to be skipped.
+void CPU::op_nop(AddressingMode mode) {
+    if (mode != Implied) {
+        operand_address(mode);
+    }
+}
+
+// --- Flag changes ---
+
+void CPU::op_clc(AddressingMode) {
+    set_flag(Carry, false);
+}
+
+void CPU::op_sec(AddressingMode) {
+    set_flag(Carry, true);
+}
+
+void CPU::op_cli(AddressingMode) {
+    set_flag(InterruptDisable, false);
+}
+
+void CPU::op_sei(AddressingMode) {
+    set_flag(InterruptDisable, true);
+}
+
+void CPU::op_cld(AddressingMode) {
+    set_flag(Decimal, false);
+}
+
+void CPU::op_sed(AddressingMode) {
+    set_flag(Decimal, true);
+}
+
+void CPU::op_clv(AddressingMode) {
+    set_flag(Overflow, false);
+}
+
+// ---------------------------------------------------------------------------
+// Undocumented instructions
+//
+// These opcodes were never part of the official instruction set. They fall out
+// of how the chip decodes opcodes, and most behave like two documented
+// instructions running at once. Some software relies on them.
+// ---------------------------------------------------------------------------
+
+// SLO: ASL memory, then ORA the result into A.
+void CPU::op_slo(AddressingMode mode) {
+    const uint8_t shifted = modify_operand(mode, &CPU::shift_left);
+    set_register(registers_.accumulator, registers_.accumulator | shifted);
+}
+
+// RLA: ROL memory, then AND the result into A.
+void CPU::op_rla(AddressingMode mode) {
+    const uint8_t rotated = modify_operand(mode, &CPU::rotate_left);
+    set_register(registers_.accumulator, registers_.accumulator & rotated);
+}
+
+// SRE: LSR memory, then EOR the result into A.
+void CPU::op_sre(AddressingMode mode) {
+    const uint8_t shifted = modify_operand(mode, &CPU::shift_right);
+    set_register(registers_.accumulator, registers_.accumulator ^ shifted);
+}
+
+// RRA: ROR memory, then ADC the result to A.
+void CPU::op_rra(AddressingMode mode) {
+    add_with_carry(modify_operand(mode, &CPU::rotate_right));
+}
+
+// DCP: DEC memory, then CMP it with A.
+void CPU::op_dcp(AddressingMode mode) {
+    compare(registers_.accumulator, modify_operand(mode, &CPU::decrement));
+}
+
+// ISC: INC memory, then SBC it from A.
+void CPU::op_isc(AddressingMode mode) {
+    subtract_with_carry(modify_operand(mode, &CPU::increment));
+}
+
+// LAX: load A and X with the same value.
+void CPU::op_lax(AddressingMode mode) {
+    set_register(registers_.accumulator, read_operand(mode));
+    registers_.x = registers_.accumulator;
+}
+
+// SAX: store A AND X.
+void CPU::op_sax(AddressingMode mode) {
+    write(operand_address(mode), registers_.accumulator & registers_.x);
+}
+
+// ANC: AND, then copy the sign bit into Carry.
+void CPU::op_anc(AddressingMode mode) {
+    set_register(registers_.accumulator, registers_.accumulator & read_operand(mode));
+    set_flag(Carry, flag(Negative));
+}
+
+// ALR: AND, then LSR A.
+void CPU::op_alr(AddressingMode mode) {
+    registers_.accumulator = shift_right(registers_.accumulator & read_operand(mode));
+}
+
+// ARR: AND, then ROR A, but with Carry and Overflow taken from bits 6 and 5
+// of the result instead of the bit shifted out.
+void CPU::op_arr(AddressingMode mode) {
+    const uint8_t masked = registers_.accumulator & read_operand(mode);
+    const uint8_t carry_in = flag(Carry) ? 0x80 : 0x00;
+    set_register(registers_.accumulator, static_cast<uint8_t>(masked >> 1 | carry_in));
+
+    const bool bit6 = (registers_.accumulator & 0x40) != 0;
+    const bool bit5 = (registers_.accumulator & 0x20) != 0;
+    set_flag(Carry, bit6);
+    set_flag(Overflow, bit6 != bit5);
+}
+
+// ANE and LXA are unstable on real hardware: the result depends on a "magic"
+// constant that varies between chips. $EE is the commonly observed value.
+void CPU::op_ane(AddressingMode mode) {
+    set_register(registers_.accumulator, (registers_.accumulator | 0xEE) & registers_.x & read_operand(mode));
 }
 
 void CPU::op_lxa(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint8_t operand = read_operand(mode, page_crossed);
-    const uint8_t value = static_cast<uint8_t>((registers_.accumulator | 0xEE) & operand);
-    registers_.accumulator = value;
-    registers_.x = value;
-    update_zero_and_negative(value);
+    set_register(registers_.accumulator, (registers_.accumulator | 0xEE) & read_operand(mode));
+    registers_.x = registers_.accumulator;
 }
 
-void CPU::op_las(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint16_t address = compute_address(mode, page_crossed);
-    uint8_t value = read(address);
-    value &= registers_.stack_pointer;
-    registers_.accumulator = value;
-    registers_.x = value;
-    registers_.stack_pointer = value;
-    update_zero_and_negative(value);
-    page_crossed_ = page_crossed_ || page_crossed;
-}
-
+// SBX: X = (A AND X) - operand, setting flags like CMP.
 void CPU::op_sbx(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint8_t operand = read_operand(mode, page_crossed);
-    const uint16_t combined = static_cast<uint16_t>(registers_.accumulator & registers_.x);
-    const uint16_t result = (combined - operand) & 0x1FF;
-    set_flag(StatusFlag::Carry, combined >= operand);
-    registers_.x = static_cast<uint8_t>(result & 0xFF);
-    update_zero_and_negative(registers_.x);
+    const uint8_t operand = read_operand(mode);
+    const uint8_t combined = registers_.accumulator & registers_.x;
+    set_flag(Carry, combined >= operand);
+    set_register(registers_.x, static_cast<uint8_t>(combined - operand));
 }
 
+// LAS: AND memory with the stack pointer and load the result into A, X and SP.
+void CPU::op_las(AddressingMode mode) {
+    set_register(registers_.accumulator, read_operand(mode) & registers_.stack_pointer);
+    registers_.x = registers_.accumulator;
+    registers_.stack_pointer = registers_.accumulator;
+}
+
+// SHA, SHX, SHY and SHS store registers ANDed with the high byte of the
+// target address plus one.
 void CPU::op_sha(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint16_t address = compute_address(mode, page_crossed);
-    uint8_t value = static_cast<uint8_t>(registers_.accumulator & registers_.x);
-    if (mode == AddressingMode::IndirectIndexed || mode == AddressingMode::AbsoluteY) {
-        const uint8_t adjust = static_cast<uint8_t>(((address >> 8) & 0xFF) + 1);
-        value = static_cast<uint8_t>(value & adjust);
-    }
-    write(address, value);
-    page_crossed_ = page_crossed_ || page_crossed;
-}
-
-void CPU::op_shs(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint16_t address = compute_address(mode, page_crossed);
-    const uint8_t value = static_cast<uint8_t>(registers_.accumulator & registers_.x);
-    registers_.stack_pointer = value;
-    const uint8_t adjust = static_cast<uint8_t>(((address >> 8) & 0xFF) + 1);
-    write(address, static_cast<uint8_t>(value & adjust));
-    page_crossed_ = page_crossed_ || page_crossed;
+    const uint16_t address = operand_address(mode);
+    write(address, registers_.accumulator & registers_.x & high_byte_plus_one(address));
 }
 
 void CPU::op_shx(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint16_t address = compute_address(mode, page_crossed);
-    const uint8_t adjust = static_cast<uint8_t>(((address >> 8) & 0xFF) + 1);
-    write(address, static_cast<uint8_t>(registers_.x & adjust));
-    page_crossed_ = page_crossed_ || page_crossed;
+    const uint16_t address = operand_address(mode);
+    write(address, registers_.x & high_byte_plus_one(address));
 }
 
 void CPU::op_shy(AddressingMode mode) {
-    bool page_crossed = false;
-    const uint16_t address = compute_address(mode, page_crossed);
-    const uint8_t adjust = static_cast<uint8_t>(((address >> 8) & 0xFF) + 1);
-    write(address, static_cast<uint8_t>(registers_.y & adjust));
-    page_crossed_ = page_crossed_ || page_crossed;
+    const uint16_t address = operand_address(mode);
+    write(address, registers_.y & high_byte_plus_one(address));
 }
 
-void CPU::op_jam(AddressingMode mode) {
-    static_cast<void>(mode);
-    throw std::runtime_error("CPU entered illegal JAM state");
+// SHS also copies A AND X into the stack pointer.
+void CPU::op_shs(AddressingMode mode) {
+    const uint16_t address = operand_address(mode);
+    registers_.stack_pointer = registers_.accumulator & registers_.x;
+    write(address, registers_.stack_pointer & high_byte_plus_one(address));
+}
+
+// On real hardware a JAM opcode freezes the CPU until it is reset. Throwing
+// makes the fault visible instead of hanging the emulator.
+void CPU::op_jam(AddressingMode) {
+    throw std::runtime_error("CPU executed a JAM opcode and halted");
 }
 
 }  // namespace emulator

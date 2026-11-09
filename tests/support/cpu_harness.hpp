@@ -16,15 +16,14 @@ constexpr uint8_t kDecimalFlag = static_cast<uint8_t>(CPU::StatusFlag::Decimal);
 constexpr uint8_t kOverflowFlag = static_cast<uint8_t>(CPU::StatusFlag::Overflow);
 constexpr uint8_t kNegativeFlag = static_cast<uint8_t>(CPU::StatusFlag::Negative);
 
+// Owns a bus and CPU, loads a short machine-code program, and resets the CPU
+// so the first step() executes the program's first instruction.
 struct Harness {
     Bus bus;
-    CPU cpu;
+    CPU cpu{bus};
 
     explicit Harness(std::initializer_list<uint8_t> program, uint16_t origin = 0x8000) {
-        cpu.attach_bus(&bus);
-        bus.attach_cpu(&cpu);
-        std::vector<uint8_t> bytes(program);
-        bus.load_program(origin, bytes);
+        bus.load_program(origin, std::vector<uint8_t>(program));
         cpu.reset();
     }
 
@@ -34,12 +33,5 @@ struct Harness {
         }
     }
 };
-
-inline void run_until(Harness& harness, uint64_t max_cycles) {
-    const uint64_t start_cycles = harness.cpu.cycles();
-    while ((harness.cpu.cycles() - start_cycles) < max_cycles) {
-        harness.cpu.step();
-    }
-}
 
 }  // namespace emulator::testing

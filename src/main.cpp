@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -13,6 +14,8 @@
 #include "cpu.hpp"
 
 namespace {
+
+constexpr uint8_t kBrkOpcode = 0x00;
 
 struct Options {
     std::filesystem::path program_path;
@@ -111,6 +114,17 @@ std::string format_hex(uint16_t value) {
     return stream.str();
 }
 
+// One line per executed instruction: where it was, what it was, and the
+// register values it left behind.
+void print_trace_line(uint16_t pc, const char* mnemonic, const emulator::CPU& cpu) {
+    const auto& registers = cpu.registers();
+    std::printf("$%04X  %s  A=%02X X=%02X Y=%02X SP=%02X P=%02X  cycles=%llu\n",
+                static_cast<unsigned>(pc), mnemonic,
+                static_cast<unsigned>(registers.accumulator), static_cast<unsigned>(registers.x),
+                static_cast<unsigned>(registers.y), static_cast<unsigned>(registers.stack_pointer),
+                static_cast<unsigned>(registers.status), static_cast<unsigned long long>(cpu.cycles()));
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -131,10 +145,7 @@ int main(int argc, char* argv[]) {
     }
 
     Bus bus;
-    CPU cpu;
-
-    cpu.attach_bus(&bus);
-    bus.attach_cpu(&cpu);
+    CPU cpu(bus);
     bus.load_program(options.start_address, program);
     cpu.reset();
 
@@ -142,30 +153,24 @@ int main(int argc, char* argv[]) {
     std::cout << "Start address: $" << format_hex(options.start_address)
               << ", cycle budget: " << options.max_cycles << std::endl;
 
-    const uint64_t start_cycles = cpu.cycles();
-    uint64_t executed_cycles = 0;
-
-    while (executed_cycles < options.max_cycles) {
+    while (cpu.cycles() < options.max_cycles) {
         const uint16_t pc = cpu.registers().program_counter;
         const uint8_t opcode = bus.read(pc);
-
-        if (options.trace) {
-            std::cout << "[PC=$" << format_hex(pc) << "] opcode $" << std::hex
-                      << std::uppercase << std::setw(2) << std::setfill('0')
-                      << static_cast<int>(opcode) << std::dec << std::setfill(' ') << std::endl;
-        }
 
         try {
             cpu.step();
         } catch (const std::exception& error) {
-            std::cerr << "Execution aborted: " << error.what() << std::endl;
+            std::cerr << "Execution aborted at $" << format_hex(pc) << ": " << error.what() << std::endl;
             return 1;
         }
 
-        executed_cycles = cpu.cycles() - start_cycles;
-        if (opcode == 0x00) {
+        if (options.trace) {
+            print_trace_line(pc, cpu.mnemonic(opcode), cpu);
+        }
+
+        if (opcode == kBrkOpcode) {
             std::cout << "BRK encountered at $" << format_hex(pc)
-                      << " after " << executed_cycles << " cycles." << std::endl;
+                      << " after " << cpu.cycles() << " cycles." << std::endl;
             return 0;
         }
     }

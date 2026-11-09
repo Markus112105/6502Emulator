@@ -1,5 +1,7 @@
-#define CATCH_CONFIG_MAIN
-#include "catch2/catch.hpp"
+#define MINI_TEST_MAIN
+#include "support/mini_test.hpp"
+
+#include <string>
 
 #include "support/cpu_harness.hpp"
 
@@ -217,4 +219,14 @@ TEST_CASE("Decimal ADC and SBC honour BCD digit behaviour", "[cpu][decimal]") {
     REQUIRE((status_after_second_sbc & kZeroFlag) == 0);
     REQUIRE((status_after_second_sbc & kNegativeFlag) == 0);
     REQUIRE(harness.cpu.cycles() == 10);
+}
+
+TEST_CASE("Every opcode decodes to a named instruction", "[cpu][table]") {
+    Harness harness({0xEA});
+
+    for (int opcode = 0; opcode <= 0xFF; ++opcode) {
+        REQUIRE(harness.cpu.mnemonic(static_cast<uint8_t>(opcode)) != nullptr);
+    }
+    REQUIRE(std::string(harness.cpu.mnemonic(0xA9)) == "LDA");
+    REQUIRE(std::string(harness.cpu.mnemonic(0x00)) == "BRK");
 }

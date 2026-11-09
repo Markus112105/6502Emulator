@@ -55,9 +55,7 @@ int main(int argc, char* argv[]) {
     }
 
     Bus bus;
-    CPU cpu;
-    cpu.attach_bus(&bus);
-    bus.attach_cpu(&cpu);
+    CPU cpu(bus);
     bus.load_memory(*image);
 
     // The image is built to be entered at $0400 rather than through its own

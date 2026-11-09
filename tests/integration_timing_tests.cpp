@@ -1,4 +1,4 @@
-#include "catch2/catch.hpp"
+#include "support/mini_test.hpp"
 
 #include "support/cpu_harness.hpp"
 

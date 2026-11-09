@@ -1,5 +1,9 @@
 #pragma once
 
+// A minimal unit-test framework: TEST_CASE registers a function, REQUIRE
+// checks a condition, and defining MINI_TEST_MAIN in one source file provides
+// a main() that runs every registered test.
+
 #include <exception>
 #include <iostream>
 #include <sstream>
@@ -7,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-namespace catch2_lite {
+namespace mini_test {
 
 // AssertionError carries context about a failed expectation so the runner can
 // surface actionable diagnostics without stopping the entire suite.
@@ -75,26 +79,26 @@ inline int run_all() {
     return failures == 0 ? 0 : 1;
 }
 
-}  // namespace catch2_lite
+}  // namespace mini_test
 
-#define CATCH_INTERNAL_JOIN_IMPL(x, y) x##y
-#define CATCH_INTERNAL_JOIN(x, y) CATCH_INTERNAL_JOIN_IMPL(x, y)
+#define MINI_TEST_JOIN_IMPL(x, y) x##y
+#define MINI_TEST_JOIN(x, y) MINI_TEST_JOIN_IMPL(x, y)
 
 #define TEST_CASE(name, ...)                                                                 \
-    static void CATCH_INTERNAL_JOIN(catch2_test_, __LINE__)();                               \
-    static ::catch2_lite::AutoReg CATCH_INTERNAL_JOIN(catch2_reg_, __LINE__)(name,           \
-                                                                                   &CATCH_INTERNAL_JOIN(catch2_test_, __LINE__)); \
-    static void CATCH_INTERNAL_JOIN(catch2_test_, __LINE__)()
+    static void MINI_TEST_JOIN(mini_test_case_, __LINE__)();                               \
+    static ::mini_test::AutoReg MINI_TEST_JOIN(mini_test_registration_, __LINE__)(name,           \
+                                                                                   &MINI_TEST_JOIN(mini_test_case_, __LINE__)); \
+    static void MINI_TEST_JOIN(mini_test_case_, __LINE__)()
 
 #define REQUIRE(expression)                                                                  \
     do {                                                                                     \
         if (!(expression)) {                                                                 \
-            throw ::catch2_lite::AssertionError(__FILE__, __LINE__, #expression);            \
+            throw ::mini_test::AssertionError(__FILE__, __LINE__, #expression);            \
         }                                                                                    \
     } while (false)
 
-#ifdef CATCH_CONFIG_MAIN
+#ifdef MINI_TEST_MAIN
 int main() {
-    return ::catch2_lite::run_all();
+    return ::mini_test::run_all();
 }
 #endif
