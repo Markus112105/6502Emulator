@@ -32,12 +32,12 @@ make functional     # downloads the functional test ROM once, then runs it
 To try it, write a short program by hand. This one stores 1 at `$0200`, counts X down from 5, and stops:
 
 ```asm
-LDA #$01
-STA $0200
-LDX #$05
-DEX        ; loop
-BNE loop
-BRK
+      LDA #$01
+      STA $0200
+      LDX #$05
+loop: DEX
+      BNE loop
+      BRK
 ```
 
 ```bash
